@@ -2,6 +2,7 @@
 //@display-name Hypirk
 //@api 3.0
 //@version 0.1.1
+//@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.ts
 
 // ============================================================================
 // Hypirk — RP memory-management plugin
