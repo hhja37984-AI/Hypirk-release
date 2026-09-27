@@ -2,7 +2,6 @@
 //@display-name Hypirk
 //@api 3.0
 //@version 0.1.1
-//@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.ts
 
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -942,6 +941,8 @@ Return JSON only in this exact shape:
     firstMessage: { role: string; content: string } | null;
     firstMessageResolved: boolean;
     alternateGreetingSelected: boolean;
+    /** Risu's character-level long-term-memory toggle, captured with the request-burst character snapshot. */
+    risuMemoryToggleEnabled: boolean;
   }
 
   let detectedChatUiMetadata: DetectedChatUiMetadata | null = null;
@@ -2175,6 +2176,14 @@ Return JSON only in this exact shape:
     const refreshGeneration = processChatMapReuseGeneration;
     const refreshPromise = (async () => {
       await ensureChatContext();
+
+      // detectCurrentChat() already snapshots the full character once for this
+      // request burst. Reuse the supaMemory value captured in that snapshot
+      // instead of cloning the whole character again for every process hook.
+      if (isRisuMemoryToggleEnabled()) {
+        suspendAutoSummaryRequestTrackingForNativeMemory();
+      }
+
       const messages = await readChatMessagesRaw();
       await reconcileMessageLinks(messages);
     })();
@@ -3013,6 +3022,7 @@ Return JSON only in this exact shape:
       firstMessage: firstMessageResult.message,
       firstMessageResolved: Boolean(char && chat),
       alternateGreetingSelected: firstMessageResult.alternateGreetingSelected,
+      risuMemoryToggleEnabled: Boolean(char?.supaMemory),
     };
     const result = { charIndex: ci, chatIndex: chi, charId, chatId };
     return result;
@@ -5098,10 +5108,10 @@ Return JSON only in this exact shape:
   }
 
   async function reconcileAutoSummaryUsage(reason: string, targetProbeId?: string): Promise<boolean> {
-    // A scheduled reconciliation may fire after the user turns Risu/HypaV3
-    // memory ON. Treat the native memory toggle as a hard suspension boundary
-    // so those delayed callbacks cannot create new automatic-summary pressure.
-    if (await isRisuMemoryToggleEnabled()) return false;
+    // Follow the native-memory mode captured for this request burst.
+    // Bursts that start with Risu/HypaV3 memory ON discard probes and invalidate
+    // delayed reconciliation callbacks before they can reach this path.
+    if (isRisuMemoryToggleEnabled()) return false;
     if (!await ensureAutoSummaryPermission("fetchLogs") || typeof risuai.getFetchLogs !== "function") return false;
     const candidates = autoSummaryRequestProbes
       .filter((probe) => probe.completedAt && !probe.reconciled)
@@ -5185,7 +5195,7 @@ Return JSON only in this exact shape:
     // Keep pending state dormant rather than consuming it while Risu/HypaV3
     // owns memory. If the native toggle is later turned OFF, Hypirk may resume
     // from that previously pending state.
-    if (await isRisuMemoryToggleEnabled()) return;
+    if (isRisuMemoryToggleEnabled()) return;
     if (!state.autoSummaryPending || isSummarizing || isLinkProcessingBlocked()) return;
     const pending = await getPendingMessages();
     const safeChunkSize = Math.max(2, Math.floor(chunkSize || DEFAULT_CHUNK_SIZE));
@@ -6438,14 +6448,23 @@ Return JSON only in this exact shape:
     return { hypaHits, chosenHits };
   }
 
-  async function isRisuMemoryToggleEnabled(): Promise<boolean> {
-    if (currentCharIndex < 0) return false;
-    try {
-      const character = await risuai.getCharacterFromIndex(currentCharIndex);
-      return Boolean((character as any)?.supaMemory);
-    } catch (error) {
-      console.log("[Hypirk] Failed to read Risu memory toggle; Hypirk memory remains enabled:", error);
-      return false;
+  function isRisuMemoryToggleEnabled(): boolean {
+    return getDetectedChatUiMetadataForCurrentContext()?.risuMemoryToggleEnabled === true;
+  }
+
+  function suspendAutoSummaryRequestTrackingForNativeMemory(): void {
+    const discardedProbeCount = autoSummaryRequestProbes.length;
+    autoSummaryRequestProbes = [];
+
+    // Invalidate delayed reconciliation callbacks from the previous Hypirk-owned
+    // request. Persisted autoSummaryPending is intentionally left untouched so it
+    // can remain dormant while native memory is enabled and resume when disabled.
+    autoSummaryReconcileGeneration += 1;
+
+    if (discardedProbeCount > 0) {
+      console.log(
+        `[Hypirk] Risu memory toggle ON; discarded ${discardedProbeCount} automatic-summary request probe(s).`,
+      );
     }
   }
 
@@ -6616,7 +6635,7 @@ Return JSON only in this exact shape:
       // automatic summary, no raw-chat pruning, and no MemoryEntry retrieval.
       // Position-scoped lorebook retrieval stays independent.
       stage = "read-risu-memory-toggle";
-      const risuMemoryToggleEnabled = await isRisuMemoryToggleEnabled();
+      const risuMemoryToggleEnabled = isRisuMemoryToggleEnabled();
 
       // Normally the process hook has already reconciled the previous request
       // and run any pending automatic summaries. Keep a fallback reconciliation
@@ -6759,7 +6778,7 @@ Return JSON only in this exact shape:
 
     // Tracking stays active under Risu/HypaV3 memory, but automatic-summary
     // accounting is suspended with the rest of Hypirk's automatic memory runtime.
-    const risuMemoryToggleEnabled = await isRisuMemoryToggleEnabled();
+    const risuMemoryToggleEnabled = isRisuMemoryToggleEnabled();
     if (!risuMemoryToggleEnabled) {
       const completedProbe = [...autoSummaryRequestProbes].reverse().find((probe) =>
         !probe.completedAt && probe.charId === currentCharId && probe.chatId === currentChatId
@@ -12205,7 +12224,7 @@ ${renderRegexPanel()}
   await risuai.addRisuScriptHandler("process", async (text) => {
     await refreshChatContextForRequestBurst();
 
-    const risuMemoryToggleEnabled = await isRisuMemoryToggleEnabled();
+    const risuMemoryToggleEnabled = isRisuMemoryToggleEnabled();
     if (risuMemoryToggleEnabled) {
       return text;
     }
