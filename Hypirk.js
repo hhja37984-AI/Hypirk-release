@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.2
+//@version 0.1.3
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.2";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.3";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -83,7 +83,7 @@ Return JSON only in this exact shape:
     const NEW_PRESET_MAX_MEMORY_TOKENS = 10000;
     const NEW_PRESET_RECENT_MEMORY_RATIO = 0.5;
     const NEW_PRESET_EVENT_FORMAT = "Date: [[time]]\n[[content]]";
-    const UI_ROLE_PALETTE_DEFAULTS = {
+        const UI_ROLE_PALETTE_DEFAULTS = {
         "--hp-radius-none": "0",
         "--hp-radius-swatch": "1.5px",
         "--hp-radius-xs": "2.1px",
@@ -530,6 +530,10 @@ Return JSON only in this exact shape:
     const JS_TIKTOKEN_VERSION = "1.0.21";
     const JS_TIKTOKEN_LITE_URL = `https://esm.sh/js-tiktoken@${JS_TIKTOKEN_VERSION}/lite`;
     const JS_TIKTOKEN_RANKS_URL = `https://esm.sh/js-tiktoken@${JS_TIKTOKEN_VERSION}/ranks/o200k_base`;
+    const LOCAL_DERIVED_CACHE_PREFIX = "hypirkproto_derived_cache_v1_";
+    function getLocalDerivedCacheKey(charId, chatId) {
+        return `${LOCAL_DERIVED_CACHE_PREFIX}${encodeURIComponent(charId)}::${encodeURIComponent(chatId)}`;
+    }
     function getLocalEmbeddingCacheKey(charId, chatId) {
         return `${LOCAL_EMBEDDING_CACHE_PREFIX}${encodeURIComponent(charId)}::${encodeURIComponent(chatId)}`;
     }
@@ -559,6 +563,17 @@ Return JSON only in this exact shape:
     let stateLoadFailed = false;
     let localEmbeddingStorage;
     let localEmbeddingCacheDirty = false;
+    let localDerivedCacheDirty = false;
+    let localEmbeddingCacheRevision = 0;
+    let localDerivedCacheRevision = 0;
+    function markEmbeddingCacheDirty() {
+        localEmbeddingCacheDirty = true;
+        localEmbeddingCacheRevision += 1;
+    }
+    function markDerivedCacheDirty() {
+        localDerivedCacheDirty = true;
+        localDerivedCacheRevision += 1;
+    }
     let compactRetrievalLedger = [];
     let compactRetrievalLedgerLoaded = false;
     /** Last in-memory search trace. Deliberately excluded from plugin state and backups. */
@@ -1688,13 +1703,16 @@ Return JSON only in this exact shape:
         }
     }
     /**
-     * Apply active regex to an array of messages (in-place).
+     * Return a processed copy of the requested message subset.
      * Only call this on the subset you actually need.
      */
-    async function applyRegexToMessages(messages, target = "summarySource") {
+    // Derived text never aliases the raw snapshot used for identity/date detection.
+    function applyRegexToMessages(messages, target = "summarySource") {
         const rules = getEffectiveRegexRules(target);
-        for (const msg of messages)
-            msg.content = applyRegexRulesToText(msg.content, rules);
+        return messages.map(message => ({
+            ...message,
+            content: applyRegexRulesToText(message.content, rules),
+        }));
     }
     // ── Batch Embedding ─────────────────────────────────────────────────────
     function normalizeEmbeddingWhitespace(text) {
@@ -1813,6 +1831,45 @@ Return JSON only in this exact shape:
             console.log("[Hypirk] Batch embedding fetch error:", e);
             return texts.map(() => null);
         }
+    }
+    // Shared mechanics; each lane retains its own text surface and scoring policy.
+    async function ensureCandidateEmbeddings(candidates, { configHash, dimensions, readCache, writeCache }) {
+        const statuses = new Map();
+        const missing = [];
+        for (const candidate of candidates) {
+            const text = candidate.text ?? candidate.memoryText;
+            if (!text) { statuses.set(candidate, "empty-node"); continue; }
+            const cache = readCache(candidate);
+            if (cache?.sourceHash === candidate.sourceHash && cache?.configHash === configHash &&
+                isFiniteEmbeddingVector(cache.embedding, dimensions)) {
+                candidate.embedding = cache.embedding;
+                statuses.set(candidate, "ok");
+            }
+            else missing.push(candidate);
+        }
+        const batches = [];
+        let batch = [], tokens = 0;
+        for (const candidate of missing) {
+            const cost = await countTokens(candidate.text ?? candidate.memoryText);
+            if (batch.length && tokens + cost > EMBEDDING_BATCH_TOKEN_LIMIT) {
+                batches.push(batch); batch = []; tokens = 0;
+            }
+            batch.push(candidate); tokens += cost;
+        }
+        if (batch.length) batches.push(batch);
+        for (const batch of batches) {
+            const vectors = await getBatchEmbeddings(batch.map(candidate => candidate.text ?? candidate.memoryText));
+            batch.forEach((candidate, index) => {
+                const embedding = vectors[index];
+                if (!isFiniteEmbeddingVector(embedding, dimensions)) {
+                    statuses.set(candidate, "node-failed"); return;
+                }
+                candidate.embedding = embedding;
+                writeCache(candidate, { embedding, sourceHash: candidate.sourceHash, configHash });
+                statuses.set(candidate, "ok");
+            });
+        }
+        return statuses;
     }
     function cosineSimilarity(a, b) {
         if (a.length !== b.length || a.length === 0)
@@ -2151,7 +2208,8 @@ Return JSON only in this exact shape:
         if (index === -1)
             return false;
         state.entries.splice(index, 1);
-        localEmbeddingCacheDirty = true;
+        markEmbeddingCacheDirty();
+        markDerivedCacheDirty();
         state.lastChosenNodeIds = state.lastChosenNodeIds.filter((id) => id !== nodeId);
         state.lastRecentNodeIds = state.lastRecentNodeIds.filter((id) => id !== nodeId);
         delete state.lastNodeScores[nodeId];
@@ -2183,7 +2241,7 @@ Return JSON only in this exact shape:
         const hadCache = hasAnyEmbeddingCache(node);
         removeEmbeddingCacheFields(node);
         if (hadCache)
-            localEmbeddingCacheDirty = true;
+            markEmbeddingCacheDirty();
     }
     function hasAnyEmbeddingCache(node) {
         return (node.embedding !== undefined ||
@@ -2194,12 +2252,6 @@ Return JSON only in this exact shape:
             node.dialogueEmbeddingConfigHash !== undefined ||
             node.embeddingChildren !== undefined ||
             node.embeddingConfig !== undefined);
-    }
-    function clearNodeEmbeddingIfTextChanged(node, previousText) {
-        if (buildNodeEmbeddingText(node) === previousText)
-            return false;
-        clearNodeEmbedding(node);
-        return true;
     }
     function parseNodeTranslationResponse(raw) {
         const fenced = raw.trim().match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1] ?? raw.trim();
@@ -2215,6 +2267,9 @@ Return JSON only in this exact shape:
         return { content: parsed.content };
     }
     async function requestNodeTranslation(node) {
+        const source = { ...node };
+        const targetLanguage = nodeTranslationLanguage;
+        const model = nodeTranslationModel;
         if (!nodeTranslationApiUrl || !nodeTranslationModel) {
             throw new Error("설정 > 기능에서 노드 번역 API URL과 모델명을 먼저 입력해주세요.");
         }
@@ -2225,14 +2280,14 @@ Return JSON only in this exact shape:
             method: "POST",
             headers,
             body: JSON.stringify({
-                model: nodeTranslationModel,
+                model,
                 messages: [
                     { role: "system", content: nodeTranslationPrompt },
                     {
                         role: "user",
                         content: JSON.stringify({
-                            targetLanguage: nodeTranslationLanguage,
-                            content: node.content,
+                            targetLanguage,
+                            content: source.content,
                         }),
                     },
                 ],
@@ -2252,10 +2307,10 @@ Return JSON only in this exact shape:
         const translated = parseNodeTranslationResponse(raw);
         return {
             ...translated,
-            targetLanguage: nodeTranslationLanguage,
-            sourceHash: nodeSourceHash(node),
+            targetLanguage,
+            sourceHash: nodeSourceHash(source),
             updatedAt: Date.now(),
-            model: nodeTranslationModel,
+            model,
             manuallyEdited: false,
         };
     }
@@ -2462,7 +2517,37 @@ Return JSON only in this exact shape:
             return;
         await risuai.pluginStorage.setItem(getCharacterTimelineSettingsKey(currentCharId), currentCharacterTimelineSettings);
     }
+    // A context lease lets an in-flight job finish against its original chat.
+    // Switching waits for leases; nested jobs may share the still-active context.
+    const activeChatOperations = new Set();
+    let chatContextSwitch = null;
+    async function withChatOperation(action) {
+        while (chatContextSwitch)
+            await chatContextSwitch;
+        const owner = { state, charId: currentCharId, chatId: currentChatId };
+        let release;
+        const settled = new Promise(resolve => { release = resolve; });
+        activeChatOperations.add(settled);
+        try { return await action(owner); }
+        finally {
+            activeChatOperations.delete(settled);
+            release();
+        }
+    }
+    function isCurrentOperation(owner) {
+        return owner.state === state && owner.charId === currentCharId && owner.chatId === currentChatId;
+    }
     async function ensureChatContext() {
+        while (chatContextSwitch || activeChatOperations.size) {
+            if (chatContextSwitch) await chatContextSwitch;
+            else await Promise.all([...activeChatOperations]);
+        }
+        const task = switchChatContext();
+        chatContextSwitch = task;
+        try { return await task; }
+        finally { if (chatContextSwitch === task) chatContextSwitch = null; }
+    }
+    async function switchChatContext() {
         // Always resolve stable identities. Array indices can be reused while a
         // character/chat object is replaced or imported into the same slot.
         const { charIndex, chatIndex, charId, chatId } = await detectCurrentChat();
@@ -2480,6 +2565,7 @@ Return JSON only in this exact shape:
             await saveStateForChat(currentCharId, currentChatId);
         }
         // Load state for new chat
+        resetProcessChatMapReuse("chat-switch");
         currentCharIndex = charIndex;
         currentChatIndex = chatIndex;
         currentCharId = charId;
@@ -2657,7 +2743,7 @@ Return JSON only in this exact shape:
                 }
             }
             // Apply regex only to pending subset
-            await applyRegexToMessages(pending);
+            pending = applyRegexToMessages(pending);
             return pending;
         }
         catch (e) {
@@ -2804,12 +2890,35 @@ Return JSON only in this exact shape:
             charId,
             chatId,
             memories,
+            updatedAt: Date.now(),
+        };
+    }
+    function buildLocalDerivedCacheRecord(charId, chatId) {
+        return {
+            format: "hypirk-local-derived-cache", schemaVersion: 1, charId, chatId,
             translationViewCache: sanitizeTranslationViewCache(state.translationViewCache),
             lastNodeScores: { ...(state.lastNodeScores ?? {}) },
             lastChosenNodeIds: [...(state.lastChosenNodeIds ?? [])],
             lastRecentNodeIds: [...(state.lastRecentNodeIds ?? [])],
-            updatedAt: Date.now(),
         };
+    }
+    async function flushLocalDerivedCacheForChat(charId, chatId) {
+        const ownerState = state;
+        const storage = await getDeviceLocalEmbeddingStorage();
+        if (state !== ownerState) return false;
+        if (!storage) return false;
+        const revision = localDerivedCacheRevision;
+        try {
+            // Keep an empty record: it supersedes legacy fields after clearing badges.
+            await storage.setItem(getLocalDerivedCacheKey(charId, chatId), buildLocalDerivedCacheRecord(charId, chatId));
+            if (state === ownerState && revision === localDerivedCacheRevision)
+                localDerivedCacheDirty = false;
+            return true;
+        }
+        catch (error) {
+            console.log("[Hypirk] Failed to save derived cache:", error);
+            return false;
+        }
     }
     function createPersistableStateWithoutEmbeddingCache() {
         const persistable = {
@@ -2829,41 +2938,38 @@ Return JSON only in this exact shape:
     }
     async function hydrateLocalEmbeddingCacheForChat(charId, chatId) {
         const storage = await getDeviceLocalEmbeddingStorage();
-        if (!storage)
-            return false;
+        if (!storage) return false;
         try {
-            const saved = await storage.getItem(getLocalEmbeddingCacheKey(charId, chatId));
-            if (!saved ||
-                saved.format !== "hypirk-local-embedding-cache" ||
-                saved.schemaVersion !== 1 ||
-                saved.charId !== charId ||
-                saved.chatId !== chatId ||
-                !saved.memories ||
-                typeof saved.memories !== "object")
-                return true;
-            for (const memory of getNodes()) {
-                // Embedded cache wins during the one-time migration from pluginStorage.
-                if (hasAnyEmbeddingCache(memory))
-                    continue;
-                const entry = readLocalEmbeddingCacheEntry(saved.memories[memory.id]);
-                if (entry)
-                    applyLocalEmbeddingCacheEntry(memory, entry);
-            }
-            if (Object.keys(state.translationViewCache ?? {}).length === 0) {
-                const rawTranslationCache = saved.translationViewCache;
-                state.translationViewCache = sanitizeTranslationViewCache(rawTranslationCache);
-                if (JSON.stringify(rawTranslationCache ?? {}) !== JSON.stringify(state.translationViewCache)) {
-                    localEmbeddingCacheDirty = true;
+            const [saved, derived] = await Promise.all([
+                storage.getItem(getLocalEmbeddingCacheKey(charId, chatId)),
+                storage.getItem(getLocalDerivedCacheKey(charId, chatId)),
+            ]);
+            const valid = saved?.format === "hypirk-local-embedding-cache" && saved.schemaVersion === 1 &&
+                saved.charId === charId && saved.chatId === chatId && saved.memories && typeof saved.memories === "object";
+            if (valid) {
+                for (const memory of getNodes()) {
+                    if (hasAnyEmbeddingCache(memory)) continue;
+                    const entry = readLocalEmbeddingCacheEntry(saved.memories[memory.id]);
+                    if (entry) applyLocalEmbeddingCacheEntry(memory, entry);
                 }
             }
-            if (Object.keys(state.lastNodeScores ?? {}).length === 0 && saved.lastNodeScores && typeof saved.lastNodeScores === "object") {
-                state.lastNodeScores = saved.lastNodeScores;
+            const validDerived = derived?.format === "hypirk-local-derived-cache" && derived.schemaVersion === 1 &&
+                derived.charId === charId && derived.chatId === chatId;
+            const metadata = validDerived ? derived : valid ? saved : null;
+            if (metadata) {
+                if (!Object.keys(state.translationViewCache ?? {}).length)
+                    state.translationViewCache = sanitizeTranslationViewCache(metadata.translationViewCache);
+                if (!Object.keys(state.lastNodeScores ?? {}).length && metadata.lastNodeScores && typeof metadata.lastNodeScores === "object")
+                    state.lastNodeScores = metadata.lastNodeScores;
+                if (!state.lastChosenNodeIds?.length && Array.isArray(metadata.lastChosenNodeIds))
+                    state.lastChosenNodeIds = metadata.lastChosenNodeIds.filter(id => typeof id === "string");
+                if (!state.lastRecentNodeIds?.length && Array.isArray(metadata.lastRecentNodeIds))
+                    state.lastRecentNodeIds = metadata.lastRecentNodeIds.filter(id => typeof id === "string");
             }
-            if ((state.lastChosenNodeIds ?? []).length === 0 && Array.isArray(saved.lastChosenNodeIds)) {
-                state.lastChosenNodeIds = saved.lastChosenNodeIds.filter((id) => typeof id === "string");
-            }
-            if ((state.lastRecentNodeIds ?? []).length === 0 && Array.isArray(saved.lastRecentNodeIds)) {
-                state.lastRecentNodeIds = saved.lastRecentNodeIds.filter((id) => typeof id === "string");
+            if (valid && ["translationViewCache", "lastNodeScores", "lastChosenNodeIds", "lastRecentNodeIds"].some(key => key in saved)) {
+                // Migrate only after both sidecars have been successfully written.
+                markDerivedCacheDirty();
+                markEmbeddingCacheDirty();
             }
             return true;
         }
@@ -2873,21 +2979,21 @@ Return JSON only in this exact shape:
         }
     }
     async function flushLocalEmbeddingCacheForChat(charId, chatId) {
+        const ownerState = state;
         const storage = await getDeviceLocalEmbeddingStorage();
+        if (state !== ownerState) return false;
         if (!storage)
             return false;
         try {
             const key = getLocalEmbeddingCacheKey(charId, chatId);
+            const revision = localEmbeddingCacheRevision;
             const record = buildLocalEmbeddingCacheRecord(charId, chatId);
-            if (Object.keys(record.memories).length > 0 ||
-                Object.keys(record.translationViewCache ?? {}).length > 0 ||
-                Object.keys(record.lastNodeScores ?? {}).length > 0 ||
-                (record.lastChosenNodeIds?.length ?? 0) > 0 ||
-                (record.lastRecentNodeIds?.length ?? 0) > 0)
+            if (Object.keys(record.memories).length > 0)
                 await storage.setItem(key, record);
             else
                 await storage.removeItem(key);
-            localEmbeddingCacheDirty = false;
+            if (state === ownerState && revision === localEmbeddingCacheRevision)
+                localEmbeddingCacheDirty = false;
             return true;
         }
         catch (error) {
@@ -2900,6 +3006,7 @@ Return JSON only in this exact shape:
         const key = getStorageKey(charId, chatId);
         stateLoadFailed = false;
         localEmbeddingCacheDirty = false;
+        localDerivedCacheDirty = false;
         let anchorsBackfilled = 0;
         let ownerIdentityMatched = true;
         try {
@@ -2907,7 +3014,7 @@ Return JSON only in this exact shape:
             let saved = await risuai.pluginStorage.getItem(key);
             let migrated = false;
             if (saved) {
-                const parsed = parseBackupFile(JSON.stringify(saved));
+                const parsed = validateBackupData(saved);
                 if (parsed) {
                     const next = createEmptyState();
                     next.entries = parsed.data.entries;
@@ -2978,7 +3085,8 @@ Return JSON only in this exact shape:
                     // The next save writes the cache sidecar first, then removes cache fields
                     // from the syncable state. On local-write failure saveStateForChat keeps
                     // the embedded fields as a lossless fallback.
-                    localEmbeddingCacheDirty = true;
+                    markEmbeddingCacheDirty();
+                    markDerivedCacheDirty();
                     migrated = true;
                 }
                 const hasStoredOwner = Boolean(state.ownerCharId || state.ownerChatId);
@@ -3054,7 +3162,21 @@ Return JSON only in this exact shape:
             linkFallbackBoundaryAllowed = false;
         }
     }
-    async function saveStateForChat(charId, chatId) {
+    let chatStateSaveQueue = Promise.resolve();
+    function saveStateForChat(charId, chatId) {
+        const ownerState = state;
+        const task = chatStateSaveQueue.then(() => {
+            if (state !== ownerState || currentCharId !== charId || currentChatId !== chatId) {
+                console.log("[Hypirk] Discarded superseded save job.");
+                return;
+            }
+            return persistStateForChat(charId, chatId);
+        });
+        chatStateSaveQueue = task.catch(() => {});
+        return task;
+    }
+    async function persistStateForChat(charId, chatId) {
+        const savingState = state;
         if (stateLoadFailed)
             throw new Error("저장 데이터 오류: 정상 백업을 불러온 후 저장할 수 있습니다.");
         const key = getStorageKey(charId, chatId);
@@ -3065,7 +3187,13 @@ Return JSON only in this exact shape:
             const usedSlots = new Set([...state.entries, ...(summarizationPreviewEntry ? [summarizationPreviewEntry] : [])].flatMap(entry => entry.linkedMessages));
             state.messages = Object.fromEntries(Object.entries(state.messages).filter(([slot]) => usedSlots.has(Number(slot))));
             const localStorageAvailable = Boolean(await getDeviceLocalEmbeddingStorage());
-            const localCacheSaved = !localEmbeddingCacheDirty || await flushLocalEmbeddingCacheForChat(charId, chatId);
+            if (state !== savingState) return;
+            // Derived metadata must reach storage before stripping legacy vector records.
+            const derivedSaved = !localDerivedCacheDirty || await flushLocalDerivedCacheForChat(charId, chatId);
+            if (state !== savingState) return;
+            const vectorsSaved = derivedSaved && (!localEmbeddingCacheDirty || await flushLocalEmbeddingCacheForChat(charId, chatId));
+            const localCacheSaved = derivedSaved && vectorsSaved && !localDerivedCacheDirty && !localEmbeddingCacheDirty;
+            if (state !== savingState) return;
             const persistableState = localStorageAvailable && localCacheSaved
                 ? createPersistableStateWithoutEmbeddingCache()
                 : state;
@@ -3593,8 +3721,11 @@ Return JSON only in this exact shape:
     }
     /** Strict current schema only. Reject the entire file if any entry is invalid. */
     function parseBackupFile(json) {
+        try { return validateBackupData(JSON.parse(json)); }
+        catch (_) { return null; }
+    }
+    function validateBackupData(data) {
         try {
-            const data = JSON.parse(json);
             if (data?.format !== "hypirk" || data.schemaVersion !== 3 || !Array.isArray(data.entries))
                 return null;
             if (data.hashRecoveryEnabled !== undefined && typeof data.hashRecoveryEnabled !== "boolean")
@@ -3668,7 +3799,7 @@ Return JSON only in this exact shape:
     /** Table-less current JSON uses current chat indices, resolved explicitly on import. */
     async function restoreFromBackup(backup) {
         await flushInlineCardChanges();
-        const verified = parseBackupFile(JSON.stringify(backup.data));
+        const verified = validateBackupData(backup.data);
         if (!verified)
             throw new Error("형식이 올바르지 않습니다.");
         const raw = await readChatMessagesRaw();
@@ -3702,7 +3833,8 @@ Return JSON only in this exact shape:
         state.lastChosenNodeIds = [];
         state.lastRecentNodeIds = [];
         state.translationVisibleNodeIds = [];
-        localEmbeddingCacheDirty = true;
+        markEmbeddingCacheDirty();
+        markDerivedCacheDirty();
         await reconcileMessageLinks(raw);
         if (state.hashRecoveryEnabled === true)
             await backfillMessageAnchors(raw);
@@ -3796,12 +3928,12 @@ Return JSON only in this exact shape:
      * Content queries retain dialogue across the configured recent-message window.
      * Both semantic and lexical dialogue use only the single most recent message.
      */
-    async function buildRetrievalInputs() {
+    async function buildRetrievalInputs(rawMessages) {
         if (currentCharIndex < 0 || currentChatIndex < 0) {
             return { embeddingQuery: "", embeddingQueries: [], querySources: [], dialogueLines: [] };
         }
         try {
-            const allMessages = await readChatMessagesRaw();
+            const allMessages = rawMessages ?? await readChatMessagesRaw();
             if (allMessages.length === 0) {
                 return { embeddingQuery: "", embeddingQueries: [], querySources: [], dialogueLines: [] };
             }
@@ -3812,9 +3944,9 @@ Return JSON only in this exact shape:
             // Apply regex only to the subset we need. Preserve the untouched
             // paragraph counts so debug output can reveal how regex processing changes
             // Query Separate boundaries.
-            const subset = [...contextMsgs, lastMsg];
+            let subset = [...contextMsgs, lastMsg];
             const originalParagraphCounts = subset.map((message) => countQueryParagraphs(message.content));
-            await applyRegexToMessages(subset, "chatQuery");
+            subset = applyRegexToMessages(subset, "chatQuery");
             const parts = subset.map((m) => m.content);
             const embeddingQueries = buildWeightedEmbeddingQueries(subset.map((message) => ({
                 text: message.content,
@@ -3832,7 +3964,7 @@ Return JSON only in this exact shape:
                 embeddingQuery: parts.join("\n"),
                 embeddingQueries,
                 querySources,
-                dialogueLines: extractDialogueLocalLines(lastMsg.content),
+                dialogueLines: extractDialogueLocalLines(subset[subset.length - 1].content),
             };
         }
         catch (e) {
@@ -4008,25 +4140,31 @@ Return JSON only in this exact shape:
         return entry ? summarizeMemoryEntry(entry, true) : false;
     }
     async function summarizeMemoryEntry(entry, replace = false) {
+        return withChatOperation(owner => summarizeMemoryEntryInContext(owner, entry, replace));
+    }
+    async function summarizeMemoryEntryInContext(owner, entry, replace = false) {
         if (isSummarizing || !state.entries.includes(entry))
             return false;
         if (!await showConfirmDialog(replace ? "이 기억을 연결 원문으로 다시 요약해 교체할까요?" : "연결 원문을 요약해 새 기억을 추가할까요?"))
             return false;
+        if (!isCurrentOperation(owner) || !state.entries.includes(entry) || isSummarizing)
+            return false;
+        const originalMemory = entry.memory;
+        const originalContent = originalMemory?.content;
         isSummarizing = true;
         try {
-            const batch = await readEntryMessages(entry);
+            let batch = await readEntryMessages(entry);
             if (!batch.length) {
                 alert("연결된 원문을 찾을 수 없습니다.");
                 return false;
             }
-            await applyRegexToMessages(batch);
+            batch = applyRegexToMessages(batch);
             const memories = await summarizeChunk(batch);
-            if (!memories?.length || !state.entries.includes(entry))
+            if (!memories?.length || !isCurrentOperation(owner) || !state.entries.includes(entry) ||
+                entry.memory !== originalMemory || entry.memory?.content !== originalContent)
                 return false;
             if (replace && entry.memory) {
-                const old = entry.memory;
-                entry.memory = { ...memories[0], id: old.id, favorite: old.favorite, likedAt: old.likedAt,
-                    category: old.category, tags: old.tags, activationCues: old.activationCues };
+                replaceMemoryFromSummary(entry, memories[0]);
             }
             else {
                 if (entry.memory === null)
@@ -4034,7 +4172,7 @@ Return JSON only in this exact shape:
                 for (const memory of memories)
                     appendMemoryEntry(memory, entry.linkedMessages);
             }
-            localEmbeddingCacheDirty = true;
+            markEmbeddingCacheDirty();
             await saveState();
             invalidateUiSessionRenderData();
             return true;
@@ -4048,6 +4186,9 @@ Return JSON only in this exact shape:
         }
     }
     async function runSummarization(count, trigger = "ui-manual") {
+        return withChatOperation(owner => runSummarizationInContext(owner, count, trigger));
+    }
+    async function runSummarizationInContext(owner, count, trigger = "ui-manual") {
         const take = count ?? chunkSize;
         if (isSummarizing) {
             return false;
@@ -4096,7 +4237,7 @@ Return JSON only in this exact shape:
                 isSummarizing = false;
                 return false;
             }
-            const batch = includeUserMessages ? window : window.filter((m) => m.role !== "user");
+            let batch = includeUserMessages ? window : window.filter((m) => m.role !== "user");
             batchCount = batch.length;
             if (batch.length === 0) {
                 outcome = "empty-after-role-filter";
@@ -4104,7 +4245,7 @@ Return JSON only in this exact shape:
             }
             // Record the complete window, including skipped user messages, once per message.
             const linkedMessages = await registerMessages(window);
-            await applyRegexToMessages(batch);
+            batch = applyRegexToMessages(batch);
             const pendingEntry = { memory: null, linkedMessages };
             summarizationPreviewEntry = pendingEntry;
             nodeListPage = Number.MAX_SAFE_INTEGER;
@@ -4112,7 +4253,7 @@ Return JSON only in this exact shape:
                 await renderUI(true);
             // Now call LLM
             const memories = await summarizeChunk(batch);
-            if (memories) {
+            if (memories && isCurrentOperation(owner)) {
                 if (!memories.length)
                     appendMemoryEntry(null, linkedMessages);
                 for (const memory of memories)
@@ -4449,6 +4590,9 @@ Return JSON only in this exact shape:
         return score;
     }
     async function reconcileAutoSummaryUsage(reason, targetProbeId) {
+        return withChatOperation(owner => reconcileAutoSummaryUsageInContext(owner, reason, targetProbeId));
+    }
+    async function reconcileAutoSummaryUsageInContext(owner, reason, targetProbeId) {
         // Follow the native-memory mode captured for this request burst.
         // Bursts that start with Risu/HypaV3 memory ON discard probes and invalidate
         // delayed reconciliation callbacks before they can reach this path.
@@ -4537,6 +4681,9 @@ Return JSON only in this exact shape:
         }
     }
     async function runPendingAutomaticSummary() {
+        return withChatOperation(owner => runPendingAutomaticSummaryInContext(owner));
+    }
+    async function runPendingAutomaticSummaryInContext(owner) {
         // Keep pending state dormant rather than consuming it while Risu/HypaV3
         // owns memory. If the native toggle is later turned OFF, Hypirk may resume
         // from that previously pending state.
@@ -4577,6 +4724,7 @@ Return JSON only in this exact shape:
                 break;
             completedChunks += 1;
         }
+        if (!isCurrentOperation(owner)) return;
         state.autoSummaryPending = completedChunks < fullChunkCount;
         await saveState();
         console.log("[Hypirk] Automatic summary finished", {
@@ -4819,11 +4967,11 @@ Return JSON only in this exact shape:
         }
         return best;
     }
-    async function retrieveRelevantNodes(query, tokenBudget, currentDialogues = [], excludedNodeIds = new Set(), expandedQueries = [], querySources = [], retrievalAt = Date.now(), retrievalTimelineDetection = null, requestQueryCount = 0) {
+    async function retrieveRelevantNodes(query, tokenBudget, currentDialogues = [], excludedNodeIds = new Set(), expandedQueries = [], querySources = [], retrievalAt = Date.now(), retrievalTimelineDetection = null, requestQueryCount = 0, budgetItems = null) {
         lastEmbeddingRetrievalTrace = null;
         const allNodes = getNodes();
         if (allNodes.length === 0) {
-            return [];
+            return { nodes: [], scores: {}, chosenIds: [], recentIds: [...excludedNodeIds], ledgerRows: [] };
         }
         // Recent memory is calculated before similarity retrieval for every placeholder
         // combination. The selected recent IDs are excluded from the similarity pool.
@@ -4903,59 +5051,21 @@ Return JSON only in this exact shape:
                         sourceHash: await hashMessageContent(memoryText),
                     };
                 }));
-                const missingCandidates = [];
-                for (const candidate of candidates) {
-                    if (!candidate.memoryText) {
-                        embeddingStatusByNode.set(candidate.node.id, "empty-node");
-                        continue;
-                    }
-                    const vectorValid = isFiniteEmbeddingVector(candidate.node.embedding, firstQueryEmbedding.length);
-                    const cacheValid = candidate.node.embeddingSourceHash === candidate.sourceHash &&
-                        candidate.node.embeddingConfigHash === configHash &&
-                        vectorValid;
-                    if (cacheValid) {
-                        embeddingStatusByNode.set(candidate.node.id, "ok");
-                    }
-                    else {
-                        missingCandidates.push(candidate);
-                    }
-                }
-                const batches = [];
-                let currentBatchTexts = [];
-                let currentBatchCandidates = [];
-                let currentBatchTokens = 0;
-                for (const candidate of missingCandidates) {
-                    const textTokens = await countTokens(candidate.memoryText);
-                    if (currentBatchTexts.length > 0 &&
-                        currentBatchTokens + textTokens > EMBEDDING_BATCH_TOKEN_LIMIT) {
-                        batches.push({ texts: currentBatchTexts, candidates: currentBatchCandidates });
-                        currentBatchTexts = [];
-                        currentBatchCandidates = [];
-                        currentBatchTokens = 0;
-                    }
-                    currentBatchTexts.push(candidate.memoryText);
-                    currentBatchCandidates.push(candidate);
-                    currentBatchTokens += textTokens;
-                }
-                if (currentBatchTexts.length > 0) {
-                    batches.push({ texts: currentBatchTexts, candidates: currentBatchCandidates });
-                }
-                for (const batch of batches) {
-                    const batchEmbeddings = await getBatchEmbeddings(batch.texts);
-                    for (let j = 0; j < batch.candidates.length; j++) {
-                        const candidate = batch.candidates[j];
-                        const nodeEmbedding = batchEmbeddings[j];
-                        if (!isFiniteEmbeddingVector(nodeEmbedding, firstQueryEmbedding.length))
-                            continue;
-                        candidate.node.embedding = nodeEmbedding;
-                        candidate.node.embeddingSourceHash = candidate.sourceHash;
-                        candidate.node.embeddingConfigHash = configHash;
-                        delete candidate.node.embeddingChildren;
-                        delete candidate.node.embeddingConfig;
-                        localEmbeddingCacheDirty = true;
-                        embeddingStatusByNode.set(candidate.node.id, "ok");
-                    }
-                }
+                const statuses = await ensureCandidateEmbeddings(candidates, {
+                    configHash, dimensions: firstQueryEmbedding.length,
+                    readCache: ({ node }) => ({ embedding: node.embedding,
+                        sourceHash: node.embeddingSourceHash, configHash: node.embeddingConfigHash }),
+                    writeCache: ({ node }, cache) => {
+                        node.embedding = cache.embedding;
+                        node.embeddingSourceHash = cache.sourceHash;
+                        node.embeddingConfigHash = cache.configHash;
+                        delete node.embeddingChildren;
+                        delete node.embeddingConfig;
+                        markEmbeddingCacheDirty();
+                    },
+                });
+                for (const candidate of candidates)
+                    embeddingStatusByNode.set(candidate.node.id, statuses.get(candidate));
                 const rankedNodes = [];
                 for (const candidate of candidates) {
                     if (embeddingStatusByNode.get(candidate.node.id) !== "ok")
@@ -5016,59 +5126,24 @@ Return JSON only in this exact shape:
                         sourceHash: await hashMessageContent(text),
                     };
                 }));
-                const missing = [];
+                const statuses = await ensureCandidateEmbeddings(candidates, {
+                    configHash: dialogueConfigHash, dimensions: dialogueReferenceEmbedding.length,
+                    readCache: ({ node }) => node.dialogueEmbeddingChildren?.length === 1 &&
+                        node.dialogueEmbeddingChildren[0].sourceHash === node.dialogueEmbeddingSourceHash
+                        ? { embedding: node.dialogueEmbeddingChildren[0].embedding,
+                            sourceHash: node.dialogueEmbeddingSourceHash, configHash: node.dialogueEmbeddingConfigHash }
+                        : null,
+                    writeCache: ({ node }, cache) => {
+                        // Preserve the existing cache schema; one bundle occupies this slot.
+                        node.dialogueEmbeddingChildren = [{ sourceHash: cache.sourceHash, embedding: cache.embedding }];
+                        node.dialogueEmbeddingSourceHash = cache.sourceHash;
+                        node.dialogueEmbeddingConfigHash = cache.configHash;
+                        markEmbeddingCacheDirty();
+                    },
+                });
                 for (const candidate of candidates) {
                     dialogueEmbeddingChildCountByNode.set(candidate.node.id, candidate.text ? 1 : 0);
-                    if (!candidate.text) {
-                        dialogueEmbeddingStatusByNode.set(candidate.node.id, "empty-node");
-                        continue;
-                    }
-                    const cache = candidate.node.dialogueEmbeddingChildren?.[0];
-                    const cacheValid = candidate.node.dialogueEmbeddingSourceHash === candidate.sourceHash &&
-                        candidate.node.dialogueEmbeddingConfigHash === dialogueConfigHash &&
-                        candidate.node.dialogueEmbeddingChildren?.length === 1 &&
-                        cache?.sourceHash === candidate.sourceHash &&
-                        isFiniteEmbeddingVector(cache.embedding, dialogueReferenceEmbedding.length);
-                    if (cacheValid) {
-                        dialogueEmbeddingStatusByNode.set(candidate.node.id, "ok");
-                    }
-                    else {
-                        missing.push(candidate);
-                    }
-                }
-                // Batch all missing Memory dialogue bundles, respecting the same token cap as Content embeddings.
-                const batches = [];
-                let currentCandidates = [];
-                let currentTexts = [];
-                let currentTokens = 0;
-                for (const candidate of missing) {
-                    const textTokens = await countTokens(candidate.text);
-                    if (currentTexts.length > 0 && currentTokens + textTokens > EMBEDDING_BATCH_TOKEN_LIMIT) {
-                        batches.push({ candidates: currentCandidates, texts: currentTexts });
-                        currentCandidates = [];
-                        currentTexts = [];
-                        currentTokens = 0;
-                    }
-                    currentCandidates.push(candidate);
-                    currentTexts.push(candidate.text);
-                    currentTokens += textTokens;
-                }
-                if (currentTexts.length > 0)
-                    batches.push({ candidates: currentCandidates, texts: currentTexts });
-                for (const batch of batches) {
-                    const vectors = await getBatchEmbeddings(batch.texts);
-                    batch.candidates.forEach((candidate, index) => {
-                        const vector = vectors[index];
-                        if (!isFiniteEmbeddingVector(vector, dialogueReferenceEmbedding.length)) {
-                            dialogueEmbeddingStatusByNode.set(candidate.node.id, "node-failed");
-                            return;
-                        }
-                        candidate.node.dialogueEmbeddingChildren = [{ sourceHash: candidate.sourceHash, embedding: vector }];
-                        candidate.node.dialogueEmbeddingSourceHash = candidate.sourceHash;
-                        candidate.node.dialogueEmbeddingConfigHash = dialogueConfigHash;
-                        localEmbeddingCacheDirty = true;
-                        dialogueEmbeddingStatusByNode.set(candidate.node.id, "ok");
-                    });
+                    dialogueEmbeddingStatusByNode.set(candidate.node.id, statuses.get(candidate));
                 }
                 for (const candidate of candidates) {
                     if (dialogueEmbeddingStatusByNode.get(candidate.node.id) !== "ok")
@@ -5164,33 +5239,12 @@ Return JSON only in this exact shape:
         // Choose nodes within the similarity-memory budget — favorites first.
         // Main-model memory budgeting uses o200k_base and includes the configured
         // separator exactly as the final chosen context will render it.
-        const chosen = [];
-        const resolvedMemorySeparator = resolveInjectionText(memorySeparator);
-        const separatorTokens = resolvedMemorySeparator ? await countMemoryTokens(resolvedMemorySeparator) : 0;
-        let usedTokens = 0;
-        // Add favorites first (sorted by time)
-        const sortedFavorites = sortNodesByTime(favorites);
-        for (const node of sortedFavorites) {
-            const nodeText = formatNodeForContext(node);
-            const nodeTokens = await countMemoryTokens(nodeText);
-            const addedTokens = nodeTokens + (chosen.length > 0 ? separatorTokens : 0);
-            if (usedTokens + addedTokens > tokenBudget)
-                continue;
-            chosen.push(node);
-            usedTokens += addedTokens;
-        }
-        // Then fill remaining budget with scored non-favorites
-        for (const { node, combined } of scored) {
-            if (combined < 0.05)
-                continue;
-            const nodeText = formatNodeForContext(node);
-            const nodeTokens = await countMemoryTokens(nodeText);
-            const addedTokens = nodeTokens + (chosen.length > 0 ? separatorTokens : 0);
-            if (usedTokens + addedTokens > tokenBudget)
-                continue;
-            chosen.push(node);
-            usedTokens += addedTokens;
-        }
+        budgetItems ??= await prepareMemoryBudgetItems(allNodes);
+        const budgetById = new Map(budgetItems.map(item => [item.node.id, item]));
+        const rankedCandidates = [...sortNodesByTime(favorites), ...scored.filter(item => item.combined >= 0.05).map(item => item.node)];
+        const selection = selectWithinTokenBudget(rankedCandidates.map(node => budgetById.get(node.id)).filter(Boolean),
+            tokenBudget, countMemoryTokensSync(resolveInjectionText(memorySeparator)), "skip");
+        const chosen = selection.items.map(item => item.node);
         // Track which nodes were chosen for similarity memory.
         for (const n of chosen) {
             chosenNodeIds.add(n.id);
@@ -5209,20 +5263,16 @@ Return JSON only in this exact shape:
                 activationContribution: item.activationCueContribution, likeBonus: item.likeBonus, total: item.combined,
             },
         }));
-        await appendCompactRetrievalLedgerRows(similarLedgerRows);
         // Sort chosen memory by time for chronological context.
         chosen.splice(0, chosen.length, ...sortNodesByTime(chosen));
-        // Persist scores to state so they survive GUI close/reopen
-        state.lastNodeScores = {};
-        for (const [id, s] of nodeScores) {
-            state.lastNodeScores[id] = s;
-        }
-        state.lastChosenNodeIds = [...chosenNodeIds];
-        state.lastRecentNodeIds = [...excludedIds];
-        localEmbeddingCacheDirty = true;
-        // Persist provenance/badges even when every embedding vector came from cache.
-        await saveState();
-        return chosen;
+        return { nodes: chosen, scores: Object.fromEntries(nodeScores),
+            chosenIds: [...chosenNodeIds], recentIds: [...excludedIds], ledgerRows: similarLedgerRows };
+    }
+    function applyRetrievalResult(result) {
+        state.lastNodeScores = result.scores;
+        state.lastChosenNodeIds = result.chosenIds;
+        state.lastRecentNodeIds = result.recentIds;
+        markDerivedCacheDirty();
     }
     const CONTEXT_TEMPLATE_FIELDS = [
         "time",
@@ -5261,73 +5311,74 @@ Return JSON only in this exact shape:
             .replace(/\n{3,}/g, "\n\n")
             .trim());
     }
-    function estimateMemoryBudget(totalTokens, recentRatio) {
-        const normalizedTotal = Math.max(0, Math.floor(totalTokens));
-        const normalizedRatio = Math.min(1, Math.max(0, recentRatio));
-        const recentBudget = Math.floor(normalizedTotal * normalizedRatio);
-        const chosenBudget = Math.max(0, normalizedTotal - recentBudget);
-        const newestFirst = sortNodesByTime(getNodes(), "desc");
-        const separatorTokens = countMemoryTokensSync(resolveInjectionText(memorySeparator));
-        let recentNodeCount = 0;
-        let recentEstimatedTokens = 0;
-        for (const node of newestFirst) {
-            const nodeTokens = countMemoryTokensSync(formatNodeForContext(node));
-            const addedTokens = nodeTokens + (recentNodeCount > 0 ? separatorTokens : 0);
-            if (recentEstimatedTokens + addedTokens > recentBudget)
-                break;
-            recentNodeCount += 1;
-            recentEstimatedTokens += addedTokens;
+    function splitMemoryBudget(totalTokens, recentRatio) {
+        const total = Math.max(0, Math.floor(totalTokens));
+        const ratio = Math.min(1, Math.max(0, recentRatio));
+        const recentBudget = Math.floor(total * ratio);
+        return { totalTokens: total, recentRatio: ratio, recentBudget, chosenBudget: total - recentBudget };
+    }
+    // Recent stops at the first overflow; ranked candidates skip oversized items.
+    function selectWithinTokenBudget(items, budget, separatorTokens, overflow = "skip") {
+        const selected = [];
+        let usedTokens = 0;
+        for (const item of items) {
+            const added = item.tokens + (selected.length ? separatorTokens : 0);
+            if (usedTokens + added > budget) {
+                if (overflow === "stop") break;
+                continue;
+            }
+            selected.push(item); usedTokens += added;
         }
-        return {
-            totalTokens: normalizedTotal,
-            recentRatio: normalizedRatio,
-            recentBudget,
-            chosenBudget,
-            recentNodeCount,
-            recentEstimatedTokens,
-        };
+        return { items: selected, usedTokens };
+    }
+    function memoryBudgetItemsSync(nodes) {
+        return nodes.map(node => {
+            const text = formatNodeForContext(node);
+            return { node, text, tokens: countMemoryTokensSync(text) };
+        });
+    }
+    async function prepareMemoryBudgetItems(nodes = getNodes()) {
+        await ensureO200kMemoryTokenizer();
+        return memoryBudgetItemsSync(nodes);
+    }
+    function estimateMemoryBudget(totalTokens, recentRatio) {
+        const budget = splitMemoryBudget(totalTokens, recentRatio);
+        const items = memoryBudgetItemsSync(sortNodesByTime(getNodes(), "desc"));
+        const recent = selectWithinTokenBudget(items, budget.recentBudget,
+            countMemoryTokensSync(resolveInjectionText(memorySeparator)), "stop");
+        return { ...budget, recentNodeCount: recent.items.length, recentEstimatedTokens: recent.usedTokens };
     }
     /**
      * Select a contiguous newest-first run that fits the current recent-memory
      * token share. The count is intentionally recalculated for every request so
      * editing a card immediately changes how many recent cards fit.
      */
-    async function selectRecentNodesWithinBudget(tokenBudget) {
-        if (tokenBudget <= 0)
-            return { nodes: [], estimatedTokens: 0 };
-        const newestFirst = sortNodesByTime(getNodes(), "desc");
-        const resolvedMemorySeparator = resolveInjectionText(memorySeparator);
-        const separatorTokens = resolvedMemorySeparator ? await countMemoryTokens(resolvedMemorySeparator) : 0;
-        const recentNewestFirst = [];
-        let estimatedTokens = 0;
-        for (const node of newestFirst) {
-            const nodeTokens = await countMemoryTokens(formatNodeForContext(node));
-            const addedTokens = nodeTokens + (recentNewestFirst.length > 0 ? separatorTokens : 0);
-            if (estimatedTokens + addedTokens > tokenBudget)
-                break;
-            recentNewestFirst.push(node);
-            estimatedTokens += addedTokens;
-        }
-        return {
-            nodes: sortNodesByTime(recentNewestFirst),
-            estimatedTokens,
-        };
+    async function selectRecentNodesWithinBudget(tokenBudget, budgetItems = null) {
+        if (tokenBudget <= 0) return { nodes: [], estimatedTokens: 0 };
+        budgetItems ??= await prepareMemoryBudgetItems();
+        const byId = new Map(budgetItems.map(item => [item.node.id, item]));
+        const newestFirst = sortNodesByTime(budgetItems.map(item => item.node), "desc");
+        const selection = selectWithinTokenBudget(newestFirst.map(node => byId.get(node.id)), tokenBudget,
+            countMemoryTokensSync(resolveInjectionText(memorySeparator)), "stop");
+        return { nodes: sortNodesByTime(selection.items.map(item => item.node)), estimatedTokens: selection.usedTokens };
     }
-    async function buildMemoryContexts(userInput, hasChosenPlaceholder) {
-        const retrievalInputs = await buildRetrievalInputs();
+    async function buildMemoryContexts(userInput, hasChosenPlaceholder, retrievalInputs = null) {
+        return withChatOperation(owner => buildMemoryContextsInContext(owner, userInput, hasChosenPlaceholder, retrievalInputs));
+    }
+    async function buildMemoryContextsInContext(owner, userInput, hasChosenPlaceholder, retrievalInputs = null) {
+        retrievalInputs ??= await buildRetrievalInputs();
         const retrievalAt = Date.now();
         const retrievalTimelineDetection = detectCurrentTimelineDate();
         const requestQueryCount = Math.max(1, retrievalInputs.embeddingQueries.length || 1);
         const query = retrievalInputs.embeddingQuery || userInput;
         const currentDialogues = retrievalInputs.dialogueLines;
-        const totalBudget = Math.max(0, Math.floor(maxMemoryTokens));
-        const effectiveRecentRatio = Math.min(1, Math.max(0, recentMemoryRatio));
-        const recentBudget = Math.floor(totalBudget * effectiveRecentRatio);
-        const chosenBudget = Math.max(0, totalBudget - recentBudget);
+        const { recentBudget, chosenBudget } = splitMemoryBudget(maxMemoryTokens, recentMemoryRatio);
+        const budgetItems = await prepareMemoryBudgetItems();
+        const renderedById = new Map(budgetItems.map(item => [item.node.id, item.text]));
         // Recent selection is always calculated first, even when only {{chosen}} is
         // present. Recent memories are an exclusion range for similarity retrieval;
         // whether they are rendered is decided separately by the placeholders.
-        const recentSelection = await selectRecentNodesWithinBudget(recentBudget);
+        const recentSelection = await selectRecentNodesWithinBudget(recentBudget, budgetItems);
         const recentIds = new Set(recentSelection.nodes.map((node) => node.id));
         // When {{hypa}} alone renders Recent + Similar as one joined block, the
         // separator between those two shares is part of the same total budget.
@@ -5338,30 +5389,27 @@ Return JSON only in this exact shape:
             ? await countMemoryTokens(resolvedMemorySeparatorForBudget)
             : 0;
         const chosenSelectionBudget = Math.max(0, chosenBudget - bridgeSeparatorTokens);
-        const chosenNodes = chosenSelectionBudget > 0
+        const retrieval = chosenSelectionBudget > 0
             ? await retrieveRelevantNodes(query, chosenSelectionBudget, currentDialogues, recentIds, retrievalInputs.embeddingQueries.length > 0
                 ? retrievalInputs.embeddingQueries
-                : [{ text: query, weight: 1, partIndex: 0, partCount: 1 }], retrievalInputs.querySources, retrievalAt, retrievalTimelineDetection, requestQueryCount)
-            : [];
-        if (chosenSelectionBudget <= 0) {
-            state.lastNodeScores = {};
-            state.lastChosenNodeIds = [];
-            state.lastRecentNodeIds = [...recentIds];
-            localEmbeddingCacheDirty = true;
-            await saveState();
-        }
+                : [{ text: query, weight: 1, partIndex: 0, partCount: 1 }], retrievalInputs.querySources, retrievalAt, retrievalTimelineDetection, requestQueryCount, budgetItems)
+            : { nodes: [], scores: {}, chosenIds: [], recentIds: [...recentIds], ledgerRows: [] };
+        if (!isCurrentOperation(owner)) return { hypaContext: "", chosenContext: "" };
+        const chosenNodes = retrieval.nodes;
+        applyRetrievalResult(retrieval);
         const recentLedgerRows = recentSelection.nodes.map((node) => buildCompactRetrievalLedgerRow({
             at: retrievalAt, node, source: "R", rank: null, selected: true, queryCount: requestQueryCount,
             timelineDetection: retrievalTimelineDetection,
         }));
-        await appendCompactRetrievalLedgerRows(recentLedgerRows);
+        await appendCompactRetrievalLedgerRows([...retrieval.ledgerRows, ...recentLedgerRows]);
+        await saveState();
         const hypaNodes = hasChosenPlaceholder
             ? recentSelection.nodes
             : sortNodesByTime([...recentSelection.nodes, ...chosenNodes]);
         const resolvedMemorySeparator = resolveInjectionText(memorySeparator);
-        const hypaContext = hypaNodes.map((node) => formatNodeForContext(node)).join(resolvedMemorySeparator);
+        const hypaContext = hypaNodes.map(node => renderedById.get(node.id) ?? "").join(resolvedMemorySeparator);
         const chosenContext = hasChosenPlaceholder
-            ? chosenNodes.map((node) => formatNodeForContext(node)).join(resolvedMemorySeparator)
+            ? chosenNodes.map(node => renderedById.get(node.id) ?? "").join(resolvedMemorySeparator)
             : "";
         return {
             hypaContext,
@@ -5473,7 +5521,10 @@ Return JSON only in this exact shape:
             console.log("[Hypirk] Failed to save lorebook embedding cache:", error);
         }
     }
-    async function buildPositionLorebookContexts(targets, fallbackQuery) {
+    async function buildPositionLorebookContexts(targets, fallbackQuery, retrievalInputs = null) {
+        return withChatOperation(owner => buildPositionLorebookContextsInContext(owner, targets, fallbackQuery, retrievalInputs));
+    }
+    async function buildPositionLorebookContextsInContext(owner, targets, fallbackQuery, retrievalInputs = null) {
         const contexts = new Map();
         for (const target of targets)
             contexts.set(target, "");
@@ -5483,7 +5534,7 @@ Return JSON only in this exact shape:
         const candidates = [];
         for (const lore of lores) {
             const positions = extractLorebookPositions(lore.content);
-            if (positions.length === 0)
+            if (!positions.some(position => targets.has(position)))
                 continue;
             const content = stripLorebookDecoratorLines(lore.content);
             if (!content)
@@ -5491,6 +5542,7 @@ Return JSON only in this exact shape:
             candidates.push({
                 lore,
                 content,
+                text: content,
                 positions,
                 sourceHash: await hashMessageContent(content),
             });
@@ -5499,7 +5551,7 @@ Return JSON only in this exact shape:
             return contexts;
         // Lorebook comparison intentionally uses one whole recent-message query.
         // It does not split dialogue or paragraphs into separate semantic lanes.
-        const retrievalInputs = await buildRetrievalInputs();
+        retrievalInputs ??= await buildRetrievalInputs();
         const query = normalizeEmbeddingWhitespace(retrievalInputs.embeddingQuery || fallbackQuery);
         if (!query)
             return contexts;
@@ -5508,50 +5560,15 @@ Return JSON only in this exact shape:
             return contexts;
         const configHash = await getLorebookEmbeddingConfigHash();
         const cached = await loadLorebookEmbeddingCache();
-        const nextCache = {};
-        const missing = [];
-        for (const candidate of candidates) {
-            const entry = cached?.entries?.[candidate.lore.uid];
-            if (entry?.sourceHash === candidate.sourceHash &&
-                entry?.configHash === configHash &&
-                isFiniteEmbeddingVector(entry.embedding, queryEmbedding.length)) {
-                candidate.embedding = entry.embedding;
-                nextCache[candidate.lore.uid] = entry;
-            }
-            else {
-                missing.push(candidate);
-            }
-        }
-        const batches = [];
-        let batch = [];
-        let batchTokens = 0;
-        for (const candidate of missing) {
-            const tokens = await countTokens(candidate.content);
-            if (batch.length > 0 && batchTokens + tokens > EMBEDDING_BATCH_TOKEN_LIMIT) {
-                batches.push(batch);
-                batch = [];
-                batchTokens = 0;
-            }
-            batch.push(candidate);
-            batchTokens += tokens;
-        }
-        if (batch.length > 0)
-            batches.push(batch);
-        for (const current of batches) {
-            const vectors = await getBatchEmbeddings(current.map((candidate) => candidate.content));
-            current.forEach((candidate, index) => {
-                const vector = vectors[index];
-                if (!isFiniteEmbeddingVector(vector, queryEmbedding.length))
-                    return;
-                candidate.embedding = vector;
-                nextCache[candidate.lore.uid] = {
-                    sourceHash: candidate.sourceHash,
-                    configHash,
-                    embedding: vector,
-                };
-            });
-        }
-        await saveLorebookEmbeddingCache(nextCache);
+        const liveIds = new Set(lores.map(lore => lore.uid));
+        const nextCache = Object.fromEntries(Object.entries(cached?.entries ?? {}).filter(([id]) => liveIds.has(id)));
+        let cacheChanged = Object.keys(nextCache).length !== Object.keys(cached?.entries ?? {}).length;
+        await ensureCandidateEmbeddings(candidates, {
+            configHash, dimensions: queryEmbedding.length,
+            readCache: candidate => cached?.entries?.[candidate.lore.uid],
+            writeCache: (candidate, cache) => { nextCache[candidate.lore.uid] = cache; cacheChanged = true; },
+        });
+        if (isCurrentOperation(owner) && cacheChanged) await saveLorebookEmbeddingCache(nextCache);
         const separator = resolveInjectionText(lorebookSeparator);
         const separatorTokens = separator ? await countMemoryTokens(separator) : 0;
         for (const target of targets) {
@@ -5563,16 +5580,11 @@ Return JSON only in this exact shape:
             }))
                 .filter((row) => row.score >= 0.05)
                 .sort((a, b) => b.score - a.score);
-            const selected = [];
-            let usedTokens = 0;
-            for (const row of ranked) {
-                const tokens = await countMemoryTokens(row.candidate.content);
-                const added = tokens + (selected.length > 0 ? separatorTokens : 0);
-                if (usedTokens + added > maxLorebookTokens)
-                    continue;
-                selected.push(row.candidate);
-                usedTokens += added;
-            }
+            const budgetItems = [];
+            for (const row of ranked)
+                budgetItems.push({ candidate: row.candidate, tokens: await countMemoryTokens(row.candidate.content) });
+            const selected = selectWithinTokenBudget(budgetItems, maxLorebookTokens, separatorTokens, "skip")
+                .items.map(item => item.candidate);
             // Relevance chooses the set; native lorebook insertion order controls the
             // final readable arrangement inside that position.
             selected.sort((a, b) => a.lore.insertOrder - b.lore.insertOrder ||
@@ -5600,14 +5612,8 @@ Return JSON only in this exact shape:
         return hits;
     }
     // ── Message Tracking ─────────────────────────────────────────────────────
-    async function trackUserMessage() {
-        invalidateUiSessionRenderData();
-        await saveState();
-    }
-    async function trackAssistantMessage() {
-        invalidateUiSessionRenderData();
-        await saveState();
-    }
+    function trackUserMessage() { invalidateUiSessionRenderData(); }
+    function trackAssistantMessage() { invalidateUiSessionRenderData(); }
     /**
      * The injection block only decides placement. {{hypa}} and {{chosen}} are
      * resolved later across the fully flattened request, so the same placeholders
@@ -5752,6 +5758,17 @@ Return JSON only in this exact shape:
     }
     // beforeRequest: inject memory context + track user messages
     async function beforeRequestHandler(messages, type) {
+        if ((type !== "main" && type !== "model") || isSummarizing) return messages;
+        try {
+            await refreshChatContextForRequestBurst();
+            return await withChatOperation(() => beforeRequestInContext(messages, type));
+        }
+        catch (error) {
+            console.error("[Hypirk] Request context failed:", error);
+            return messages;
+        }
+    }
+    async function beforeRequestInContext(messages, type) {
         // Only process main chat requests — skip auxiliary model calls (memory, emotion, translate, etc.)
         if (type !== "main" && type !== "model") {
             return messages;
@@ -5764,8 +5781,7 @@ Return JSON only in this exact shape:
         try {
             // One full charId + chat.id identity check per request burst. If process
             // already performed it for this request, the shared burst gate reuses it.
-            stage = "refresh-chat-context";
-            await refreshChatContextForRequestBurst();
+            stage = "chat-context-ready";
             // RisuAI reuses character.supaMemory for its long-term-memory toggle,
             // including HypaMemory V3. While that toggle is ON, Hypirk remains
             // available as a management/manual-summary tool, but its automatic memory
@@ -5815,10 +5831,12 @@ Return JSON only in this exact shape:
                 if (!hasHypaPlaceholder && !hasChosenPlaceholder && lorebookPositionTargets.size === 0) {
                     return messages;
                 }
+                // One raw snapshot and preprocessing pass for both retrieval lanes.
+                const retrievalInputs = await buildRetrievalInputs(currentRawMessages);
                 let contexts = null;
                 if ((hasHypaPlaceholder || hasChosenPlaceholder) && !risuMemoryToggleEnabled) {
                     stage = "build-memory-contexts";
-                    contexts = await buildMemoryContexts(lastUserContent, hasChosenPlaceholder);
+                    contexts = await buildMemoryContexts(lastUserContent, hasChosenPlaceholder, retrievalInputs);
                 }
                 else if (risuMemoryToggleEnabled) {
                     // Consume only placeholders already present in the flattened request.
@@ -5850,7 +5868,7 @@ Return JSON only in this exact shape:
                 }
                 if (lorebookPositionTargets.size > 0) {
                     stage = "build-position-lorebook-contexts";
-                    const lorebookContexts = await buildPositionLorebookContexts(lorebookPositionTargets, lastUserContent);
+                    const lorebookContexts = await buildPositionLorebookContexts(lorebookPositionTargets, lastUserContent, retrievalInputs);
                     stage = "replace-position-placeholders";
                     const positionHits = replaceLorebookPositionPlaceholdersInMessages(messages, lorebookContexts);
                     console.log(`[Hypirk] Lorebook position placeholders replaced: hits=${positionHits}, targets=${[...lorebookPositionTargets].join(",")}`);
@@ -5957,6 +5975,35 @@ Return JSON only in this exact shape:
         memoryRedoStack.length = 0;
         updateMemoryHistoryButtons();
     }
+    // All field edits share identity checks, invalidation and persistence scheduling.
+    function editMemory(node, updates, { history = false, deferred = true } = {}) {
+        if (findNodeById(node.id) !== node) return false;
+        let changed = false;
+        for (const [field, value] of Object.entries(updates)) {
+            const before = node[field];
+            if (JSON.stringify(before) === JSON.stringify(value)) continue;
+            const next = structuredClone(value);
+            if (history) recordMemoryEdit(node, field, before, next);
+            if (next === undefined) delete node[field];
+            else node[field] = next;
+            // Both narration and quoted dialogue derive from content.
+            if (field === "content") clearNodeEmbedding(node);
+            changed = true;
+        }
+        if (changed && deferred) scheduleInlineNodeSave(node);
+        return changed;
+    }
+    async function commitMemoryEdit(node, updates) {
+        if (editMemory(node, updates, { deferred: false })) await saveState();
+    }
+    function replaceMemoryFromSummary(entry, memory) {
+        if (!state.entries.includes(entry) || !entry.memory) return false;
+        const old = entry.memory;
+        entry.memory = { ...memory, id: old.id, favorite: old.favorite, likedAt: old.likedAt,
+            category: old.category, tags: old.tags, activationCues: old.activationCues };
+        markEmbeddingCacheDirty();
+        return true;
+    }
     async function applyMemoryHistory(redo) {
         const source = redo ? memoryRedoStack : memoryUndoStack;
         const destination = redo ? memoryUndoStack : memoryRedoStack;
@@ -5971,19 +6018,8 @@ Return JSON only in this exact shape:
         }
         const node = edit.node;
         const value = structuredClone(redo ? edit.after : edit.before);
-        if (edit.field === "content") {
-            const previousText = buildNodeEmbeddingText(node);
-            node.content = value;
-            clearNodeEmbeddingIfTextChanged(node, previousText);
-        }
-        else if (edit.field === "translation")
-            node.translation = value;
-        else if (edit.field === "activationCues")
-            node.activationCues = value;
-        else
-            node.time = value;
+        editMemory(node, { [edit.field]: value });
         destination.push(edit);
-        scheduleInlineNodeSave(node);
         await renderUI(true);
     }
     const selectedMemoryEntries = new Set();
@@ -6369,7 +6405,10 @@ Return JSON only in this exact shape:
         toolbarMenuEvents?.abort();
         document.body.innerHTML = `
       <style>
-        :root { ${getUiPaletteCssVariables()} color-scheme:var(--hp-color-scheme); accent-color:var(--hp-primary); --hp-reading-body:${getReadingTypography().body}px; --hp-reading-dialogue:${getReadingTypography().dialogue}px; --hp-reading-font:${getReadingFontFamilyCss()}; --hp-ui-font:14px; --hp-ui-font-small:13px; --hp-ui-font-meta:12px; --hp-border-width:1.5px; --hp-border-width-subtle:1.25px; }
+        :root { ${getUiPaletteCssVariables()} --hp-reading-body:${getReadingTypography().body}px; --hp-reading-dialogue:${getReadingTypography().dialogue}px; --hp-reading-font:${getReadingFontFamilyCss()}; }
+      </style>
+      <style>
+        :root { color-scheme:var(--hp-color-scheme); accent-color:var(--hp-primary); --hp-ui-font:14px; --hp-ui-font-small:13px; --hp-ui-font-meta:12px; --hp-border-width:1.5px; --hp-border-width-subtle:1.25px; }
         html, body { width:100%; height:100%; }
         body { margin:0; display:flex; align-items:center; justify-content:center; overflow:hidden; background:var(--hp-page-backdrop); }
         .hp-wrap { box-sizing:border-box; display:flex; flex-direction:column; width:50vw; height:100vh; max-width:100vw; max-height:100vh; overflow:visible; border:var(--hp-border-width) solid var(--hp-border); border-radius:var(--hp-radius-modal); box-shadow:0 18px 48px rgba(0,0,0,.35); color:var(--hp-text); font-family:var(--hp-reading-font); background:var(--hp-background); }
@@ -7310,9 +7349,10 @@ Return JSON only in this exact shape:
             try {
                 if (!getMemoryEntry(node))
                     throw new Error("기억을 찾을 수 없습니다.");
-                node.category = category.value.trim() || undefined;
-                node.tags = [...new Set(tags.value.split(",").map(tag => tag.trim()).filter(Boolean))];
-                await saveState();
+                await commitMemoryEdit(node, {
+                    category: category.value.trim() || undefined,
+                    tags: [...new Set(tags.value.split(",").map(tag => tag.trim()).filter(Boolean))],
+                });
                 committed = true;
                 invalidateUiSessionRenderData();
                 overlay.remove();
@@ -7392,8 +7432,7 @@ Return JSON only in this exact shape:
             try {
                 if (!getMemoryEntry(node))
                     throw new Error("기억을 찾을 수 없습니다.");
-                node.activationCues = [...new Set(cues.value.split(",").map(cue => cue.trim()).filter(Boolean))];
-                await saveState();
+                await commitMemoryEdit(node, { activationCues: [...new Set(cues.value.split(",").map(cue => cue.trim()).filter(Boolean))] });
                 committed = true;
                 recordMemoryEdit(node, "activationCues", previous, [...(node.activationCues ?? [])]);
                 invalidateUiSessionRenderData();
@@ -8273,11 +8312,11 @@ ${renderRegexPanel()}
     }
     async function loadChunkViewerData(entry) {
         const raw = await readEntryMessages(entry);
-        const messages = raw.map(message => ({ ...message, cacheContent: message.content,
+        let messages = raw.map(message => ({ ...message, cacheContent: message.content,
             cacheKey: message.chatId, displayIdx: message.index }));
         if (!messages.length)
             return null;
-        await applyRegexToMessages(messages);
+        messages = applyRegexToMessages(messages);
         return { title: `연결된 메시지 (${messages.length}) ${formatEntryMessageRange(entry)}`, messages };
     }
     function cleanChunkMessageDisplay(text) {
@@ -8333,7 +8372,7 @@ ${renderRegexPanel()}
         const rawValue = await findCachedTranslation(message.cacheContent);
         const value = rawValue ? cleanChunkMessageDisplay(rawValue) || null : null;
         cache[message.cacheKey] = { sourceHash, value, checkedAt: Date.now() };
-        localEmbeddingCacheDirty = true;
+        markDerivedCacheDirty();
         return { value, reused: false };
     }
     function mountChunkMessageViewer(root, title, messages, inline = false, onClose, onResummarize) {
@@ -9157,13 +9196,14 @@ ${renderRegexPanel()}
         if (localStorage) {
             try {
                 const keys = await localStorage.keys();
-                for (const key of keys.filter((item) => item.startsWith(LOCAL_EMBEDDING_CACHE_PREFIX))) {
-                    const parsed = parseLocalEmbeddingCacheKey(key);
+                for (const key of keys.filter(item => item.startsWith(LOCAL_EMBEDDING_CACHE_PREFIX) || item.startsWith(LOCAL_DERIVED_CACHE_PREFIX))) {
+                    const parsed = parseLocalEmbeddingCacheKey(key.replace(LOCAL_DERIVED_CACHE_PREFIX, LOCAL_EMBEDDING_CACHE_PREFIX));
                     if (!parsed)
                         continue;
-                    const record = await localStorage.getItem(key);
+                    const record = await localStorage.getItem(getLocalEmbeddingCacheKey(parsed.charId, parsed.chatId)) ?? {};
                     if (record && typeof record === "object") {
-                        localRecords.set(`${parsed.charId}\u0000${parsed.chatId}`, record);
+                        const derived = await localStorage.getItem(getLocalDerivedCacheKey(parsed.charId, parsed.chatId));
+                        localRecords.set(`${parsed.charId}\u0000${parsed.chatId}`, { ...record, ...(derived ?? {}) });
                     }
                 }
             }
@@ -9515,9 +9555,8 @@ ${renderRegexPanel()}
     function attachUIEvents(pendingMessages) {
         restoreSettingsEdits();
         // Helper: wrap async handlers with error boundary
-        function safeAsync(fn, context) {
-            return async () => {
-                const settingsAction = /^(main-nav-|close-after-inline-save|(?:select|add|copy|rename|delete|import)-summary-preset|(?:select|add|copy|delete)-memory-injection-profile|save-search-settings|(?:add|delete|import)-.*regex)/.test(context);
+        function safeAsync(fn, context, { settingsAction = false } = {}) {
+            return async (...args) => {
                 if (settingsActionBusy)
                     return;
                 const workspace = document.querySelector(".hp-settings-workspace");
@@ -9527,7 +9566,7 @@ ${renderRegexPanel()}
                         workspace.inert = true;
                 }
                 try {
-                    await fn();
+                    await fn(...args);
                 }
                 catch (e) {
                     console.error(`[Hypirk] UI error (${context}):`, e);
@@ -9603,7 +9642,7 @@ ${renderRegexPanel()}
                 await risuai.hideContainer();
                 settingsEdits.clear();
                 regexSettingsDraft = null;
-            }, "close-after-inline-save"));
+            }, "close-after-inline-save", { settingsAction: true }));
         }
         // Full-message viewing is available only inside the manual-summary dialog.
         document.querySelectorAll(".hp-summarize-pending-message").forEach((row) => {
@@ -9649,7 +9688,7 @@ ${renderRegexPanel()}
                 await loadLorebookPageContext();
                 if (activeTab === "lorebook")
                     await renderUI(false);
-            }, `main-nav-${targetTab}`));
+            }, `main-nav-${targetTab}`, { settingsAction: true }));
         };
         bindMainNavToggle("hp-nav-settings", "settings");
         bindMainNavToggle("hp-nav-lorebook", "lorebook");
@@ -9794,36 +9833,13 @@ ${renderRegexPanel()}
                     if (value === previousValue)
                         return;
                     previousValue = value;
-                    let changed = false;
                     const field = editor.classList.contains("hp-card-inline-time") ? "time"
                         : editor.closest(".hp-card-inline-editor")?.dataset.inlineKind === "translation" ? "translation" : "content";
-                    const before = structuredClone(node[field]);
-                    if (editor.classList.contains("hp-card-inline-time")) {
-                        const time = normalizeTimeString(value);
-                        if (node.time !== time) {
-                            node.time = time;
-                            changed = true;
-                        }
-                    }
-                    else if (editor.closest(".hp-card-inline-editor")?.dataset.inlineKind === "translation") {
-                        if (node.translation && node.translation.content !== value) {
-                            node.translation.content = value;
-                            node.translation.manuallyEdited = true;
-                            node.translation.updatedAt = Date.now();
-                            changed = true;
-                        }
-                    }
-                    else if (node.content !== value) {
-                        const previousEmbeddingText = buildNodeEmbeddingText(node);
-                        node.content = value;
-                        clearNodeEmbeddingIfTextChanged(node, previousEmbeddingText);
-                        // Token cache is keyed by complete text; new content gets a new key.
-                        changed = true;
-                    }
-                    if (changed) {
-                        recordMemoryEdit(node, field, before, node[field]);
-                        scheduleInlineNodeSave(node);
-                    }
+                    if (field === "translation" && (!node.translation || node.translation.content === value)) return;
+                    const next = field === "time" ? normalizeTimeString(value)
+                        : field === "translation" ? { ...node.translation, content: value, manuallyEdited: true, updatedAt: Date.now() }
+                        : value;
+                    editMemory(node, { [field]: next }, { history: true });
                 };
                 editor.addEventListener("input", applyChangedEditor);
                 editor.addEventListener("blur", applyChangedEditor);
@@ -9958,7 +9974,8 @@ ${renderRegexPanel()}
                 if (!ok2)
                     return;
                 state = createEmptyState();
-                localEmbeddingCacheDirty = true;
+                markEmbeddingCacheDirty();
+                markDerivedCacheDirty();
                 await saveState();
                 nodeListPage = 0;
                 invalidateUiSessionRenderData();
@@ -10021,8 +10038,7 @@ ${renderRegexPanel()}
                 const node = findNodeById(nodeId);
                 if (!node)
                     return;
-                node.favorite = !node.favorite;
-                await saveState();
+                await commitMemoryEdit(node, { favorite: !node.favorite });
                 renderUI();
             }, "fav-node"));
         });
@@ -10033,21 +10049,21 @@ ${renderRegexPanel()}
                 const node = findNodeById(nodeId);
                 if (!node)
                     return;
-                if (getLikeRemaining(node) > 0)
-                    delete node.likedAt;
-                else
-                    node.likedAt = Date.now();
-                await saveState();
+                await commitMemoryEdit(node, { likedAt: getLikeRemaining(node) > 0 ? undefined : Date.now() });
                 renderUI();
             }, "like-node"));
         });
-        const translateNode = async (node) => {
+        const translateNode = (node) => withChatOperation(async owner => {
             if (translatingNodeIds.has(node.id))
                 return;
             translatingNodeIds.add(node.id);
             await renderTranslationUI();
             try {
-                node.translation = await requestNodeTranslation(node);
+                const sourceContent = node.content;
+                const translation = await requestNodeTranslation(node);
+                if (!isCurrentOperation(owner) || findNodeById(node.id) !== node || node.content !== sourceContent)
+                    return;
+                editMemory(node, { translation }, { deferred: false });
                 setNodeTranslationVisible(node.id, true);
                 await saveState();
             }
@@ -10058,7 +10074,7 @@ ${renderRegexPanel()}
                 translatingNodeIds.delete(node.id);
                 await renderTranslationUI();
             }
-        };
+        });
         document.querySelectorAll(".hp-toggle-node-translation").forEach((btn) => {
             btn.addEventListener("click", safeAsync(async () => {
                 const node = findNodeById(btn.dataset.nodeId);
@@ -10181,7 +10197,13 @@ ${renderRegexPanel()}
                     return;
                 }
                 // Run retrieval
-                await retrieveRelevantNodes(retrievalInputs.embeddingQuery, maxMemoryTokens, retrievalInputs.dialogueLines, new Set(), retrievalInputs.embeddingQueries, retrievalInputs.querySources);
+                await withChatOperation(async owner => {
+                    const result = await retrieveRelevantNodes(retrievalInputs.embeddingQuery, maxMemoryTokens, retrievalInputs.dialogueLines, new Set(), retrievalInputs.embeddingQueries, retrievalInputs.querySources);
+                    if (!isCurrentOperation(owner)) return;
+                    applyRetrievalResult(result);
+                    await appendCompactRetrievalLedgerRows(result.ledgerRows);
+                    await saveState();
+                });
                 // Switch to nodes tab to show results
                 activeTab = "nodes";
                 // This is a cross-tab result view: start at the top instead of
@@ -10624,7 +10646,7 @@ ${renderRegexPanel()}
                     state.lastChosenNodeIds = [];
                     state.lastRecentNodeIds = [];
                     lastEmbeddingRetrievalTrace = null;
-                    localEmbeddingCacheDirty = true;
+                    markDerivedCacheDirty();
                     await saveState();
                 }
             }
@@ -10636,7 +10658,7 @@ ${renderRegexPanel()}
             const status = document.getElementById("hp-search-save-status");
             if (status)
                 status.textContent = "Query 문단 묶음과 검색 신호를 저장했습니다.";
-        }, "save-search-settings"));
+        }, "save-search-settings", { settingsAction: true }));
         // Main-model memory injection namespace profiles.
         const injectionProfileSelect = document.getElementById("hp-memory-injection-profile-select");
         const readMemoryInjectionProfileFromUI = () => ({
@@ -10675,7 +10697,7 @@ ${renderRegexPanel()}
             applyMemoryInjectionProfile(selected);
             await saveSettings();
             await renderUI(true);
-        }, "select-memory-injection-profile"));
+        }, "select-memory-injection-profile", { settingsAction: true }));
         document.getElementById("hp-add-memory-injection-profile")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitInjectionSettings()))
                 return;
@@ -10688,7 +10710,7 @@ ${renderRegexPanel()}
             };
             clearSettingsEdits(INJECTION_FIELDS);
             await renderUI(true);
-        }, "add-memory-injection-profile"));
+        }, "add-memory-injection-profile", { settingsAction: true }));
         document.getElementById("hp-copy-memory-injection-profile")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitInjectionSettings()))
                 return;
@@ -10702,7 +10724,7 @@ ${renderRegexPanel()}
             };
             clearSettingsEdits(INJECTION_FIELDS);
             await renderUI(true);
-        }, "copy-memory-injection-profile"));
+        }, "copy-memory-injection-profile", { settingsAction: true }));
         const commitInjectionSettings = async () => {
             if (!memoryInjectionDraft && !INJECTION_FIELDS.some(id => settingsEdits.has(id)))
                 return true;
@@ -10806,7 +10828,7 @@ ${renderRegexPanel()}
             await saveMemoryInjectionProfiles();
             await saveSettings();
             await renderUI(true);
-        }, "delete-memory-injection-profile"));
+        }, "delete-memory-injection-profile", { settingsAction: true }));
         // Prompt: reset
         const resetPromptBtn = document.getElementById("hp-reset-prompt");
         if (resetPromptBtn) {
@@ -10861,7 +10883,7 @@ ${renderRegexPanel()}
             await savePrompt();
             await saveSettings();
             await renderUI(true);
-        }, "select-summary-preset"));
+        }, "select-summary-preset", { settingsAction: true }));
         document.getElementById("hp-add-preset")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitPresetSettings())) {
                 await populatePresetSelect();
@@ -10876,7 +10898,7 @@ ${renderRegexPanel()}
             await savePrompt();
             await saveSettings();
             await renderUI(true);
-        }, "add-summary-preset"));
+        }, "add-summary-preset", { settingsAction: true }));
         document.getElementById("hp-copy-current-preset")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitPresetSettings())) {
                 await populatePresetSelect();
@@ -10900,7 +10922,7 @@ ${renderRegexPanel()}
             await savePrompt();
             await saveSettings();
             await renderUI(true);
-        }, "copy-summary-preset"));
+        }, "copy-summary-preset", { settingsAction: true }));
         document.getElementById("hp-rename-current-preset")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitPresetSettings())) {
                 await populatePresetSelect();
@@ -10929,7 +10951,7 @@ ${renderRegexPanel()}
             await savePresets(presets);
             await saveSettings();
             await renderUI(true);
-        }, "rename-summary-preset"));
+        }, "rename-summary-preset", { settingsAction: true }));
         document.getElementById("hp-delete-current-preset")?.addEventListener("click", safeAsync(async () => {
             if (!(await commitPresetSettings())) {
                 await populatePresetSelect();
@@ -10953,7 +10975,7 @@ ${renderRegexPanel()}
             await savePrompt();
             await saveSettings();
             await renderUI(true);
-        }, "delete-summary-preset"));
+        }, "delete-summary-preset", { settingsAction: true }));
         const importPresetBtn = document.getElementById("hp-import-preset");
         const importFileInput = document.getElementById("hp-import-file");
         importPresetBtn?.addEventListener("click", () => importFileInput?.click());
@@ -10985,7 +11007,7 @@ ${renderRegexPanel()}
             finally {
                 importFileInput.value = "";
             }
-        }, "import-summary-preset"));
+        }, "import-summary-preset", { settingsAction: true }));
         // ── Unified Regex Library handlers ─────────────────────────────────
         const regexDraft = getRegexSettingsDraft();
         const readRuleCard = (card) => {
@@ -11033,7 +11055,7 @@ ${renderRegexPanel()}
                 regexDraft.ids = (regexDraft.ids ?? []).filter((v) => v !== id);
                 regexDraft.dirty = true;
                 await renderUI(true);
-            }, "delete-regex-rule"));
+            }, "delete-regex-rule", { settingsAction: true }));
         });
         document.getElementById("hp-regex-add-rule")?.addEventListener("click", safeAsync(async () => {
             const rule = createRegexRule();
@@ -11041,7 +11063,7 @@ ${renderRegexPanel()}
             expandedRegexRuleIds.add(rule.id);
             regexDraft.dirty = true;
             await renderUI(true);
-        }, "add-regex-rule"));
+        }, "add-regex-rule", { settingsAction: true }));
         const regexFile = document.getElementById("hp-regex-import-file");
         document.getElementById("hp-regex-import-json")?.addEventListener("click", () => regexFile?.click());
         regexFile?.addEventListener("change", safeAsync(async () => {
@@ -11061,7 +11083,7 @@ ${renderRegexPanel()}
             regexDraft.rules.push(...rules);
             regexDraft.dirty = true;
             await renderUI(true);
-        }, "import-regex-json"));
+        }, "import-regex-json", { settingsAction: true }));
         document.getElementById("hp-regex-import-character")?.addEventListener("click", safeAsync(async () => {
             const rules = await fetchCurrentCharacterRegexRules();
             if (!rules.length) {
@@ -11071,7 +11093,7 @@ ${renderRegexPanel()}
             regexDraft.rules.push(...rules);
             regexDraft.dirty = true;
             await renderUI(true);
-        }, "import-character-regex"));
+        }, "import-character-regex", { settingsAction: true }));
     }
     function escapeHtml(text) {
         return text
@@ -11120,7 +11142,10 @@ ${renderRegexPanel()}
     // When chunks exist, only messages with chat_index > lastSummarizedMsgIndex are kept.
     // The first message (chat_index -1) is handled via msgIndex -1 in chunks.
     await risuai.addRisuScriptHandler("process", async (text) => {
+        // Auxiliary summary calls may re-enter plugin hooks; never wait on our own lease.
+        if (isSummarizing) return text;
         await refreshChatContextForRequestBurst();
+        return withChatOperation(async () => {
         const risuMemoryToggleEnabled = isRisuMemoryToggleEnabled();
         if (risuMemoryToggleEnabled) {
             return text;
@@ -11140,6 +11165,7 @@ ${renderRegexPanel()}
         // Chunks exist — filter out already-summarized messages
         const firstPendingIdx = lastIdx + 1;
         return `{{#if {{greater_equal::{{chat_index}}::${firstPendingIdx}}}}}\n${text}\n{{/if}}`;
+        });
     });
     // Register replacers for message tracking and memory injection
     await risuai.addRisuReplacer("beforeRequest", beforeRequestHandler);
