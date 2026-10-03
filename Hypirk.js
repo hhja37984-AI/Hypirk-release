@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.3
+//@version 0.1.4
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.3";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.4";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -2395,8 +2395,7 @@ Return JSON only in this exact shape:
         if (!trimmed)
             return "";
         // Respect explicit memory blocks from a user-authored summarization prompt.
-        // Until block-splitting is implemented, an untagged model response is treated
-        // as one Memory and receives the boundary tag automatically.
+        // An untagged model response is treated as one Memory.
         if (/<memory>[\s\S]*?<\/memory>/i.test(trimmed))
             return trimmed;
         return `<memory>\n${trimmed}\n</memory>`;
@@ -2404,14 +2403,81 @@ Return JSON only in this exact shape:
     function parseMemoriesFromSummary(raw) {
         const memories = [];
         const getId = nextNodeId;
+        if (/<\/?index\b/i.test(raw)) {
+            // Accept either memory > index or index > memory boundaries.
+            const indexedText = String(raw).replace(/<\/?memory\s*>/gi, "").trim()
+                .replace(/^```(?:xml|html|text)?\s*\n/i, "").replace(/\n```\s*$/, "");
+            const indexRegex = /<index\s*=\s*(["'])\s*(-?\d+)\s*(?:[-–—]\s*(-?\d+)\s*)?\1\s*>([\s\S]*?)<\/index\s*>/gi;
+            let cursor = 0;
+            let indexed;
+            while ((indexed = indexRegex.exec(indexedText)) !== null) {
+                if (indexedText.slice(cursor, indexed.index).trim() || /<\/?index\b/i.test(indexed[4]))
+                    throw new Error("Invalid or mixed summary index blocks");
+                const start = Number(indexed[2]);
+                const end = Number(indexed[3] ?? indexed[2]);
+                if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < -1 || end < start)
+                    throw new Error("Invalid summary index range");
+                const memory = parseMemoryBlock(indexed[4], getId);
+                if (!memory)
+                    throw new Error("Empty summary index block");
+                memories.push({ memory, indexRange: [start, end] });
+                cursor = indexRegex.lastIndex;
+            }
+            if (!memories.length || indexedText.slice(cursor).trim())
+                throw new Error("Malformed summary index blocks");
+            return memories;
+        }
         const memoryRegex = /<memory>([\s\S]*?)<\/memory>/gi;
         let match;
         while ((match = memoryRegex.exec(raw)) !== null) {
             const memory = parseMemoryBlock(match[1], getId);
             if (memory)
-                memories.push(memory);
+                memories.push({ memory, indexRange: null });
         }
         return memories;
+    }
+    function resolveSummaryEntries(parsed, linkedMessages) {
+        const slots = [...new Set(linkedMessages)];
+        const indexed = parsed.some(item => item.indexRange !== null);
+        const records = slots.map(slot => ({ slot, index: state.messages[String(slot)]?.index }));
+        const indices = records.map(record => record.index).filter(Number.isInteger);
+        if (indexed && indices.length !== records.length)
+            throw new Error("Summary source message references are unresolved");
+        const minIndex = Math.min(...indices);
+        const maxIndex = Math.max(...indices);
+        const covered = new Set();
+        const entries = parsed.map(({ memory, indexRange }) => {
+            let links = slots;
+            if (indexRange) {
+                const [start, end] = indexRange;
+                if (start < minIndex || end > maxIndex)
+                    throw new Error("Summary index range is outside the source window");
+                links = records.filter(record => record.index >= start && record.index <= end).map(record => record.slot);
+                if (!links.length)
+                    throw new Error("Summary index range has no source messages");
+            }
+            links.forEach(slot => covered.add(slot));
+            return { memory, linkedMessages: [...links] };
+        });
+        // Keep processed source coverage, including omitted user messages, without
+        // attaching those messages to an unrelated indexed memory.
+        const uncovered = slots.filter(slot => !covered.has(slot));
+        if ((indexed || !parsed.length) && uncovered.length)
+            entries.push({ memory: null, linkedMessages: uncovered });
+        entries.indexed = indexed;
+        return entries;
+    }
+    function parseSummaryEntries(raw, linkedMessages) {
+        try {
+            return resolveSummaryEntries(parseMemoriesFromSummary(raw), linkedMessages);
+        }
+        catch (error) {
+            // Preserve paid model output even when index syntax or source ranges
+            // are unusable. Keep all response text and use the legacy full window.
+            console.log("[Hypirk] Falling back to unsegmented summary:", error);
+            const memory = parseMemoryBlock(String(raw).replace(/<\/?memory\s*>/gi, ""), nextNodeId);
+            return [{ memory, linkedMessages: [...new Set(linkedMessages)] }];
+        }
     }
     function splitTimeFromOpaqueContent(block) {
         const normalized = String(block ?? "").replace(/\r\n?/g, "\n").trim();
@@ -4069,11 +4135,11 @@ Return JSON only in this exact shape:
         }
         return { messages, usedChatML: true };
     }
-    async function summarizeChunk(messages) {
+    async function summarizeChunk(messages, linkedMessages) {
         if (messages.length === 0) {
             return null;
         }
-        const messagesText = messages.map((m) => m.content).join("\n\n");
+        const messagesText = messages.map((m) => `<index="${m.index}">\n${m.content}\n</index>`).join("\n\n");
         const parsedPrompt = buildPromptMessages(summaryPrompt, messagesText);
         const summarizerNote = state.summarizerNote?.trim() ?? "";
         if (summarizerNote && parsedPrompt.messages.length > 0) {
@@ -4103,7 +4169,7 @@ Return JSON only in this exact shape:
             // Strip <Thoughts>...</Thoughts> block if present (some models emit thinking)
             const cleanedOutput = rawOutput.replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, "").trim();
             const memoryWrappedOutput = ensureMemoryWrappedSummary(cleanedOutput);
-            return parseMemoriesFromSummary(memoryWrappedOutput);
+            return parseSummaryEntries(memoryWrappedOutput, linkedMessages);
         }
         catch (e) {
             console.log("[Hypirk] Summarization failed:", e);
@@ -4159,18 +4225,27 @@ Return JSON only in this exact shape:
                 return false;
             }
             batch = applyRegexToMessages(batch);
-            const memories = await summarizeChunk(batch);
-            if (!memories?.length || !isCurrentOperation(owner) || !state.entries.includes(entry) ||
+            const summaryEntries = await summarizeChunk(batch, entry.linkedMessages);
+            if (!summaryEntries?.some(result => result.memory) || !isCurrentOperation(owner) || !state.entries.includes(entry) ||
                 entry.memory !== originalMemory || entry.memory?.content !== originalContent)
                 return false;
             if (replace && entry.memory) {
-                replaceMemoryFromSummary(entry, memories[0]);
+                replaceMemoryFromSummary(entry, summaryEntries[0].memory);
+                // Legacy rerolls keep their single-memory replacement behavior.
+                if (summaryEntries.indexed) {
+                    entry.linkedMessages = summaryEntries[0].linkedMessages;
+                    for (const extra of summaryEntries.slice(1))
+                        appendMemoryEntry(extra.memory, extra.linkedMessages);
+                }
             }
             else {
-                if (entry.memory === null)
-                    entry.memory = memories.shift();
-                for (const memory of memories)
-                    appendMemoryEntry(memory, entry.linkedMessages);
+                if (entry.memory === null) {
+                    const first = summaryEntries.shift();
+                    entry.memory = first.memory;
+                    entry.linkedMessages = first.linkedMessages;
+                }
+                for (const result of summaryEntries)
+                    appendMemoryEntry(result.memory, result.linkedMessages);
             }
             markEmbeddingCacheDirty();
             await saveState();
@@ -4252,13 +4327,11 @@ Return JSON only in this exact shape:
             if (document.getElementById("hp-body"))
                 await renderUI(true);
             // Now call LLM
-            const memories = await summarizeChunk(batch);
-            if (memories && isCurrentOperation(owner)) {
-                if (!memories.length)
-                    appendMemoryEntry(null, linkedMessages);
-                for (const memory of memories)
-                    appendMemoryEntry(memory, linkedMessages);
-                nodesCreated = memories.length;
+            const summaryEntries = await summarizeChunk(batch, linkedMessages);
+            if (summaryEntries && isCurrentOperation(owner)) {
+                for (const entry of summaryEntries)
+                    appendMemoryEntry(entry.memory, entry.linkedMessages);
+                nodesCreated = summaryEntries.filter(entry => entry.memory).length;
                 outcome = "done";
                 updateLastVerifiedSummarizedIndex();
                 await saveState();
