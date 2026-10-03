@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.4
+//@version 0.1.5
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.4";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.5";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -2403,28 +2403,28 @@ Return JSON only in this exact shape:
     function parseMemoriesFromSummary(raw) {
         const memories = [];
         const getId = nextNodeId;
-        if (/<\/?index\b/i.test(raw)) {
-            // Accept either memory > index or index > memory boundaries.
+        if (/<\/?scene\b/i.test(raw)) {
+            // Accept either memory > scene or scene > memory boundaries.
             const indexedText = String(raw).replace(/<\/?memory\s*>/gi, "").trim()
                 .replace(/^```(?:xml|html|text)?\s*\n/i, "").replace(/\n```\s*$/, "");
-            const indexRegex = /<index\s*=\s*(["'])\s*(-?\d+)\s*(?:[-–—]\s*(-?\d+)\s*)?\1\s*>([\s\S]*?)<\/index\s*>/gi;
+            const indexRegex = /<scene\s+range\s*=\s*(["'])\s*(-?\d+)\s*(?:[-–—]\s*(-?\d+)\s*)?\1\s*>([\s\S]*?)<\/scene\s*>/gi;
             let cursor = 0;
             let indexed;
             while ((indexed = indexRegex.exec(indexedText)) !== null) {
-                if (indexedText.slice(cursor, indexed.index).trim() || /<\/?index\b/i.test(indexed[4]))
-                    throw new Error("Invalid or mixed summary index blocks");
+                if (indexedText.slice(cursor, indexed.index).trim() || /<\/?scene\b/i.test(indexed[4]))
+                    throw new Error("Invalid or mixed summary scene blocks");
                 const start = Number(indexed[2]);
                 const end = Number(indexed[3] ?? indexed[2]);
                 if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < -1 || end < start)
-                    throw new Error("Invalid summary index range");
+                    throw new Error("Invalid summary scene range");
                 const memory = parseMemoryBlock(indexed[4], getId);
                 if (!memory)
-                    throw new Error("Empty summary index block");
+                    throw new Error("Empty summary scene block");
                 memories.push({ memory, indexRange: [start, end] });
                 cursor = indexRegex.lastIndex;
             }
             if (!memories.length || indexedText.slice(cursor).trim())
-                throw new Error("Malformed summary index blocks");
+                throw new Error("Malformed summary scene blocks");
             return memories;
         }
         const memoryRegex = /<memory>([\s\S]*?)<\/memory>/gi;
@@ -2472,7 +2472,7 @@ Return JSON only in this exact shape:
             return resolveSummaryEntries(parseMemoriesFromSummary(raw), linkedMessages);
         }
         catch (error) {
-            // Preserve paid model output even when index syntax or source ranges
+            // Preserve paid model output even when scene syntax or source ranges
             // are unusable. Keep all response text and use the legacy full window.
             console.log("[Hypirk] Falling back to unsegmented summary:", error);
             const memory = parseMemoryBlock(String(raw).replace(/<\/?memory\s*>/gi, ""), nextNodeId);
@@ -11256,3 +11256,4 @@ ${renderRegexPanel()}
         await openSettings();
     });
 })();
+
