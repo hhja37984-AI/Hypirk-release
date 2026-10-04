@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.5
+//@version 0.1.6
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.5";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.6";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -5700,7 +5700,9 @@ Return JSON only in this exact shape:
         let hypaHits = 0;
         let chosenHits = 0;
         for (const message of messages) {
-            hypaHits += message.content.split(HYPA_CONTEXT_PLACEHOLDER).length - 1;
+            if (message.role === "system") {
+                hypaHits += message.content.split(HYPA_CONTEXT_PLACEHOLDER).length - 1;
+            }
             chosenHits += message.content.split(CHOSEN_CONTEXT_PLACEHOLDER).length - 1;
         }
         return { hypaHits, chosenHits };
@@ -5724,7 +5726,8 @@ Return JSON only in this exact shape:
         let chosenHits = 0;
         for (let i = 0; i < messages.length; i++) {
             const content = messages[i].content;
-            const hypaCount = content.split(HYPA_CONTEXT_PLACEHOLDER).length - 1;
+            const replaceHypa = messages[i].role === "system";
+            const hypaCount = replaceHypa ? content.split(HYPA_CONTEXT_PLACEHOLDER).length - 1 : 0;
             const chosenCount = content.split(CHOSEN_CONTEXT_PLACEHOLDER).length - 1;
             if (hypaCount === 0 && chosenCount === 0)
                 continue;
@@ -5732,7 +5735,7 @@ Return JSON only in this exact shape:
             chosenHits += chosenCount;
             messages[i] = {
                 ...messages[i],
-                content: replaceAllLiteral(replaceAllLiteral(content, HYPA_CONTEXT_PLACEHOLDER, hypaContext), CHOSEN_CONTEXT_PLACEHOLDER, chosenContext),
+                content: replaceAllLiteral(replaceHypa ? replaceAllLiteral(content, HYPA_CONTEXT_PLACEHOLDER, hypaContext) : content, CHOSEN_CONTEXT_PLACEHOLDER, chosenContext),
             };
         }
         return { hypaHits, chosenHits };
@@ -5791,22 +5794,17 @@ Return JSON only in this exact shape:
      * - anchor: an existing string in the flattened system prompt
      * - template: the memory block to insert immediately BEFORE that anchor
      *
-     * If the configured anchor is absent, the observed system/history boundary
-     * is used as the fallback insertion point. No alternative anchor is inferred.
+     * The configured anchor is searched in every system message in array order.
+     * If it is absent, the observed system/history boundary is used as fallback.
+     * No alternative anchor is inferred.
      */
     function injectMemoryAtHistoryBoundary(messages, profile) {
         const renderedTemplate = renderMemoryInjectionTemplate(profile.template);
         if (!renderedTemplate)
             return "none";
-        const boundary = findSystemHistoryBoundary(messages);
-        if (!boundary) {
-            console.warn("[Hypirk] Could not find first system -> first non-system boundary; memory not injected");
-            return "boundary-not-found";
-        }
-        diagnoseHistoryRoleAlternation(messages, boundary.firstNonSystemIndex);
         const anchor = resolveInjectionText(profile.anchor);
         if (anchor.length > 0) {
-            for (let i = boundary.firstSystemIndex; i < boundary.firstNonSystemIndex; i++) {
+            for (let i = 0; i < messages.length; i++) {
                 if (messages[i].role !== "system")
                     continue;
                 const matchIndex = messages[i].content.indexOf(anchor);
@@ -5821,8 +5819,14 @@ Return JSON only in this exact shape:
                 console.log(`[Hypirk] Memory injected before configured anchor: message=${i}, index=${matchIndex}, matchedLength=${anchor.length}`);
                 return "configured-anchor-before";
             }
-            console.warn(`[Hypirk] Configured memory injection anchor was not found in the initial system section; using system/history boundary`);
+            console.warn(`[Hypirk] Configured memory injection anchor was not found in any system message; using system/history boundary`);
         }
+        const boundary = findSystemHistoryBoundary(messages);
+        if (!boundary) {
+            console.warn("[Hypirk] Could not find first system -> first non-system boundary; memory not injected");
+            return "boundary-not-found";
+        }
+        diagnoseHistoryRoleAlternation(messages, boundary.firstNonSystemIndex);
         messages.splice(boundary.firstNonSystemIndex, 0, {
             role: "system",
             content: renderedTemplate,
