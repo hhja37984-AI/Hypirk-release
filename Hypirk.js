@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.7
+//@version 0.1.8
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.7";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.8";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -585,6 +585,9 @@ Return JSON only in this exact shape:
     let currentCharId = "";
     let currentChatId = "";
     let detectedChatUiMetadata = null;
+    let inheritanceContext = null;
+    let inheritanceOffer = null;
+    let inheritanceApplying = false;
     function getDetectedChatUiMetadataForCurrentContext() {
         const metadata = detectedChatUiMetadata;
         if (!metadata ||
@@ -2618,6 +2621,9 @@ Return JSON only in this exact shape:
             alternateGreetingSelected: firstMessageResult.alternateGreetingSelected,
             risuMemoryToggleEnabled: Boolean(char?.supaMemory),
         };
+        inheritanceContext = { charId, chatId, chat, names: new Map(
+            (Array.isArray(char?.chats) ? char.chats : []).map((room) => [String(room?.id ?? ""), String(room?.name ?? "")]),
+        ) };
         const result = { charIndex: ci, chatIndex: chi, charId, chatId };
         return result;
     }
@@ -3142,6 +3148,189 @@ Return JSON only in this exact shape:
             return false;
         }
     }
+    function inheritanceBranchId(chat) {
+        const messages = Array.isArray(chat?.message) ? chat.message : [];
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const match = /^\s*\{\{specialcomment::branchedfrom::([^:}]+)::/.exec(String(messages[i]?.data ?? ""));
+            if (match)
+                return match[1];
+        }
+        return "";
+    }
+    function inheritanceEligible(chat, value) {
+        return Array.isArray(value?.entries) && value.entries.length === 0 &&
+            (Array.isArray(chat?.message) ? chat.message : []).some((message) => {
+                const chatId = typeof message?.chatId === "string" ? message.chatId : "";
+                const content = String(message?.data ?? "");
+                return chatId && chatId !== FIRST_MESSAGE_CHAT_ID && content.trim() &&
+                    !/^\s*\{\{specialcomment::/.test(content);
+            });
+    }
+    function inheritanceEntries(source, chat, branch) {
+        if (!Array.isArray(source?.entries) || !source.messages || typeof source.messages !== "object")
+            return [];
+        const messages = Array.isArray(chat?.message) ? chat.message : [];
+        const currentIds = new Set(messages.map((message) => String(message?.chatId ?? "")).filter(Boolean));
+        const fits = (entry) => Array.isArray(entry.linkedMessages) && entry.linkedMessages.every((slot) => {
+            const record = source.messages[String(slot)];
+            return Boolean(record && (record.chatId === FIRST_MESSAGE_CHAT_ID || currentIds.has(record.chatId)));
+        });
+        let entries;
+        if (branch) {
+            entries = [];
+            let prefixOpen = true;
+            for (const entry of source.entries) {
+                if (entry.linkedMessages.length === 0) {
+                    entries.push(entry);
+                    continue;
+                }
+                if (prefixOpen && fits(entry))
+                    entries.push(entry);
+                else
+                    prefixOpen = false;
+            }
+        }
+        else {
+            if (!source.entries.every(fits))
+                return [];
+            entries = source.entries;
+        }
+        const hasRealMessageEvidence = entries.some((entry) => entry.linkedMessages.some((slot) => {
+            const id = source.messages[String(slot)]?.chatId;
+            return id && id !== FIRST_MESSAGE_CHAT_ID && currentIds.has(id);
+        }));
+        return hasRealMessageEvidence ? entries : [];
+    }
+    async function applyInheritedMemory(candidate, charId, chatId) {
+        if (inheritanceApplying)
+            return false;
+        inheritanceApplying = true;
+        const owner = state;
+        try {
+            if (stateLoadFailed || state !== owner || currentCharId !== charId || currentChatId !== chatId ||
+                owner.entries.length || isSummarizing || !inheritanceContext ||
+                inheritanceContext.charId !== charId || inheritanceContext.chatId !== chatId)
+                return false;
+            const chat = await risuai.getChatFromIndex(currentCharIndex, currentChatIndex);
+            if (state !== owner || currentCharId !== charId || currentChatId !== chatId ||
+                chat?.id !== chatId || !inheritanceEligible(chat, owner))
+                return false;
+            const branchId = inheritanceBranchId(chat);
+            if (branchId && branchId !== candidate.id)
+                return false;
+            const source = candidate.value;
+            const entries = inheritanceEntries(source, chat, Boolean(branchId));
+            if (!entries.length)
+                return false;
+            const copied = JSON.parse(JSON.stringify(source));
+            copied.entries = JSON.parse(JSON.stringify(entries));
+            copied.messages = {};
+            const currentIndexById = new Map((chat.message ?? []).map((message, index) => [String(message?.chatId ?? ""), index]));
+            for (const slot of new Set(copied.entries.flatMap((entry) => entry.linkedMessages))) {
+                const record = source.messages[String(slot)];
+                copied.messages[String(slot)] = {
+                    ...record,
+                    index: record.chatId === FIRST_MESSAGE_CHAT_ID ? -1 : currentIndexById.get(record.chatId),
+                    anchor: record.anchor ? { ...record.anchor } : null,
+                };
+            }
+            copied.ownerCharId = charId;
+            copied.ownerChatId = chatId;
+            copied.lastNodeScores = {};
+            copied.lastChosenNodeIds = [];
+            copied.lastRecentNodeIds = [];
+            copied.autoSummaryPending = false;
+            delete copied.autoSummaryLastUsage;
+            delete copied.autoSummaryLastFetchLogKey;
+            delete copied.lastVerifiedSummarizedIndex;
+            delete copied.translationViewCache;
+            copied.translationVisibleNodeIds = [];
+            const previous = state;
+            const previousCacheFlags = [localEmbeddingCacheDirty, localDerivedCacheDirty,
+                localEmbeddingCacheRevision, localDerivedCacheRevision];
+            state = copied;
+            markEmbeddingCacheDirty();
+            markDerivedCacheDirty();
+            try {
+                await saveStateForChat(charId, chatId);
+            }
+            catch (error) {
+                if (state === copied) {
+                    state = previous;
+                    [localEmbeddingCacheDirty, localDerivedCacheDirty,
+                        localEmbeddingCacheRevision, localDerivedCacheRevision] = previousCacheFlags;
+                }
+                throw error;
+            }
+            if (state !== copied || currentCharId !== charId || currentChatId !== chatId)
+                return false;
+            linkRecoveryIdentityConfirmed = true;
+            linkFallbackBoundaryAllowed = false;
+            await reconcileMessageLinks(await readChatMessagesRaw());
+            inheritanceOffer = null;
+            invalidateUiSessionRenderData();
+            return true;
+        }
+        finally {
+            inheritanceApplying = false;
+        }
+    }
+    async function discoverInheritedMemory(charId, chatId) {
+        inheritanceOffer = null;
+        const context = inheritanceContext;
+        const owner = state;
+        const key = getStorageKey(charId, chatId);
+        if (!context || context.charId !== charId || context.chatId !== chatId ||
+            !inheritanceEligible(context.chat, owner))
+            return;
+        const branchId = inheritanceBranchId(context.chat);
+        const prefix = `hypirkproto_entries_v2_${charId}_`;
+        try {
+            const keys = branchId ? [getStorageKey(charId, branchId)] : await risuai.pluginStorage.keys();
+            const candidates = [];
+            for (const sourceKey of keys) {
+                if (!sourceKey.startsWith(prefix) || sourceKey === key)
+                    continue;
+                const id = sourceKey.slice(prefix.length);
+                if (!id || !context.names.has(id))
+                    continue;
+                let source;
+                try { source = await risuai.pluginStorage.getItem(sourceKey); }
+                catch (_) { continue; }
+                const verified = validateBackupData(source);
+                if (!verified || (source.ownerCharId && source.ownerCharId !== charId) ||
+                    (source.ownerChatId && source.ownerChatId !== id))
+                    continue;
+                const entries = inheritanceEntries(source, context.chat, Boolean(branchId));
+                if (!entries.length)
+                    continue;
+                const value = JSON.parse(JSON.stringify(source));
+                value.entries = JSON.parse(JSON.stringify(entries));
+                candidates.push({ id, name: context.names.get(id) || `채팅 ${id.slice(-12)}`, value });
+            }
+            if (state !== owner || currentCharId !== charId || currentChatId !== chatId || owner.entries.length)
+                return;
+            if (candidates.length === 1)
+                await applyInheritedMemory(candidates[0], charId, chatId);
+            else if (candidates.length > 1)
+                inheritanceOffer = { key, candidates };
+        }
+        catch (error) {
+            console.warn("[Hypirk] Memory inheritance lookup failed:", error);
+        }
+    }
+    function renderInheritanceOffer() {
+        const offer = inheritanceOffer;
+        if (!offer || offer.key !== getStorageKey(currentCharId, currentChatId) || state.entries.length !== 0)
+            return "";
+        return `<div class="hp-edit-overlay" id="hp-inheritance-modal"><div class="hp-edit-box" role="dialog" aria-modal="true" aria-labelledby="hp-inherit-title" tabindex="-1" style="max-width:480px;">
+          <h3 id="hp-inherit-title">불러올 기억 선택</h3><p>현재 채팅에 연결된 기억을 선택하세요.</p>
+          <div style="max-height:45vh;overflow:auto;">${offer.candidates.map((candidate, index) => {
+            const preview = candidate.value.entries.find((entry) => entry.memory)?.memory?.content ?? "";
+            return `<button class="hp-btn primary" type="button" data-inherit-source="${index}" style="display:block;width:100%;margin:8px 0;text-align:left;">${escapeHtml(candidate.name)} · 엔트리 ${candidate.value.entries.length}개${preview ? `<span style="display:block;font-size:12px;opacity:.8;">${escapeHtml(preview.slice(0, 90))}</span>` : ""}</button>`;
+          }).join("")}</div>
+          <button class="hp-btn secondary" type="button" id="hp-inherit-decline">가져오지 않기</button></div></div>`;
+    }
     async function loadStateForChat(charId, chatId) {
         await flushInlineCardChanges();
         const key = getStorageKey(charId, chatId);
@@ -3302,6 +3491,8 @@ Return JSON only in this exact shape:
             currentLinkHealthStatus = "no-links";
             linkFallbackBoundaryAllowed = false;
         }
+        if (!stateLoadFailed)
+            await discoverInheritedMemory(charId, chatId);
     }
     let chatStateSaveQueue = Promise.resolve();
     function saveStateForChat(charId, chatId) {
@@ -4340,7 +4531,8 @@ Return JSON only in this exact shape:
     }
     async function runSummarizationInContext(owner, count, trigger = "ui-manual") {
         const take = count ?? chunkSize;
-        if (isSummarizing) {
+        if (isSummarizing || inheritanceApplying ||
+            (inheritanceOffer?.key === getStorageKey(currentCharId, currentChatId) && state.entries.length === 0)) {
             return false;
         }
         if (isLinkProcessingBlocked()) {
@@ -6575,6 +6767,7 @@ Return JSON only in this exact shape:
     }
     function renderUIWithPendingCached(pendingMessages, charName, chatName, restoreScrollTop) {
         settingsHelpSequence = 0;
+        const inheritanceModal = renderInheritanceOffer();
         currentUiTimelineDetection = detectCurrentTimelineDate();
         ensureMaterialSymbolsFont();
         ensureReadingFonts();
@@ -7093,7 +7286,7 @@ Return JSON only in this exact shape:
           .hp-regex-actions .hp-btn { flex:1 1 0; }
         }
       </style>
-      <div class="hp-wrap">
+      <div class="hp-wrap"${inheritanceModal ? " inert" : ""}>
         <div class="hp-tabs" data-version-label="${DISTRIBUTION_VERSION_LABEL}">
           <div class="hp-main-nav" id="hp-main-nav">
             <button class="hp-main-nav-button${activeTab === "settings" ? " active" : ""}" id="hp-nav-settings" type="button" aria-pressed="${activeTab === "settings"}">설정</button>
@@ -7117,6 +7310,7 @@ Return JSON only in this exact shape:
       <div class="hp-inline-save-status" id="hp-inline-save-status" hidden>저장 중…</div>
       ${showSummarizeDialog ? renderSummarizeDialog(pendingMessages) : ""}
       ${showCreateNodeDialog ? renderCreateNodeOverlay() : ""}
+      ${inheritanceModal}
     `;
         attachSettingsHelpEvents();
         attachUIEvents(pendingMessages);
@@ -9760,6 +9954,20 @@ ${renderRegexPanel()}
                 }
             };
         }
+        document.querySelectorAll("[data-inherit-source]").forEach((button) => {
+            button.addEventListener("click", safeAsync(async () => {
+                const offer = inheritanceOffer;
+                if (!offer || offer.key !== getStorageKey(currentCharId, currentChatId))
+                    return;
+                const candidate = offer.candidates[Number(button.dataset.inheritSource)];
+                if (candidate && await withChatOperation(() => applyInheritedMemory(candidate, currentCharId, currentChatId)))
+                    await renderUI();
+            }, "inherit-memory"));
+        });
+        document.getElementById("hp-inherit-decline")?.addEventListener("click", () => {
+            inheritanceOffer = null;
+            renderUI();
+        });
         document.querySelectorAll("[data-copy-text]").forEach((element) => {
             element.addEventListener("click", async () => {
                 const value = element.dataset.copyText ?? "";
