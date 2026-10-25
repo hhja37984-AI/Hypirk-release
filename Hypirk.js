@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.6
+//@version 0.1.7
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.6";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.7";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -63,8 +63,10 @@ Return JSON only in this exact shape:
     const DEFAULT_DIALOGUE_EMBEDDING_WEIGHT = 0.08;
     const DEFAULT_ACTIVATION_CUE_WEIGHT = 0.06;
     const RETRIEVAL_HISTORY_TOP_N = 30;
-    const NODE_EMBEDDING_SCHEMA_VERSION = 4;
-    const LOREBOOK_EMBEDDING_SCHEMA_VERSION = 1;
+    const NODE_EMBEDDING_SCHEMA_VERSION = 5;
+    const LOREBOOK_EMBEDDING_SCHEMA_VERSION = 2;
+    const VOYAGE_CONTEXTUAL_EMBEDDINGS_URL = "https://api.voyageai.com/v1/contextualizedembeddings";
+    const VOYAGE_CONTEXTUAL_EMBEDDINGS_MODEL = "voyage-context-3";
     const DEFAULT_EVENT_FORMAT = "Time: [[time]]\n[[content]]";
     function normalizeContentOnlyEventFormat(value) {
         const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
@@ -506,8 +508,8 @@ Return JSON only in this exact shape:
     function getStorageKey(charId, chatId) {
         return `hypirkproto_entries_v2_${charId}_${chatId}`;
     }
-    const LOCAL_EMBEDDING_CACHE_PREFIX = "hypirkproto_embedding_cache_v1_";
-    const LOCAL_LOREBOOK_EMBEDDING_CACHE_PREFIX = "hypirkproto_lorebook_embedding_cache_v1_";
+    const LOCAL_EMBEDDING_CACHE_PREFIX = "hypirkproto_embedding_cache_v2_";
+    const LOCAL_LOREBOOK_EMBEDDING_CACHE_PREFIX = "hypirkproto_lorebook_embedding_cache_v2_";
     // Compact retrieval ledger. Stored as positional strings in pluginStorage.
     // v1 fields (pipe-delimited):
     //  0 version, 1 wall-clock ms, 2 character(id~name), 3 chat(id~name), 4 node id,
@@ -1765,22 +1767,33 @@ Return JSON only in this exact shape:
         }
         return out.join("\n");
     }
-    async function getDialogueEmbeddingConfigHash() {
-        return hashMessageContent([
-            "dialogue-embedding-schema:v2-bundle",
-            embeddingUrl,
-            embeddingModel,
-            `memory-embedding-regex:${getRegexTargetSignature("memoryEmbedding")}`,
-        ].join("\u0000"));
-    }
     async function getNodeEmbeddingConfigHash() {
         return hashMessageContent([
             `node-embedding-schema:${NODE_EMBEDDING_SCHEMA_VERSION}`,
-            "node-embedding-text-mode:narration-only-query-separated-v2",
-            embeddingUrl,
-            embeddingModel,
+            `model:${getContextualEmbeddingModel() ?? "invalid"}`,
+            `endpoint:${VOYAGE_CONTEXTUAL_EMBEDDINGS_URL}`,
+            "input-type:document",
+            "document-lanes:narration-dialogue-group-v1",
             `memory-embedding-regex:${getRegexTargetSignature("memoryEmbedding")}`,
         ].join("\u0000"));
+    }
+    function hasEmbeddingConfiguration() {
+        // The saved URL remains the existing opt-in gate; Voyage uses its fixed endpoint.
+        if (!embeddingUrl || !embeddingApiKey)
+            return false;
+        if (!getContextualEmbeddingModel()) {
+            console.log("[Hypirk] Embedding model must be voyage-context-3 or voyage-context-4.");
+            return false;
+        }
+        return true;
+    }
+    function getContextualEmbeddingModel() {
+        const configured = String(embeddingModel ?? "").trim();
+        if (!configured)
+            return VOYAGE_CONTEXTUAL_EMBEDDINGS_MODEL;
+        return configured === "voyage-context-3" || configured === "voyage-context-4"
+            ? configured
+            : null;
     }
     function isFiniteEmbeddingVector(value, dimensions) {
         return (Array.isArray(value) &&
@@ -1789,86 +1802,148 @@ Return JSON only in this exact shape:
             value.every((item) => typeof item === "number" && Number.isFinite(item)));
     }
     /**
-     * Fetch embeddings for multiple texts in a single API call.
-     * Returns an array of embeddings in the same order as the input texts.
-     * Each element is either a number[] or null if the embedding failed.
+     * Voyage returns one result group per input group and one vector per chunk.
+     * Keep API indices authoritative so reordered or incomplete replies fail closed.
      */
-    async function getBatchEmbeddings(texts) {
-        if (!embeddingUrl || texts.length === 0) {
-            return texts.map(() => null);
-        }
+    async function getBatchContextualEmbeddings(groups, inputType = null) {
+        const model = getContextualEmbeddingModel();
+        if (!embeddingUrl || !embeddingApiKey || !model || groups.length === 0)
+            return groups.map(() => null);
         try {
-            const body = {
-                input: texts,
-            };
-            if (embeddingModel)
-                body.model = embeddingModel;
-            const headers = { "Content-Type": "application/json" };
-            if (embeddingApiKey)
-                headers["Authorization"] = `Bearer ${embeddingApiKey}`;
-            const response = await risuai.nativeFetch(embeddingUrl, {
+            const body = { inputs: groups, model };
+            if (inputType)
+                body.input_type = inputType;
+            const response = await risuai.nativeFetch(VOYAGE_CONTEXTUAL_EMBEDDINGS_URL, {
                 method: "POST",
-                headers,
+                headers: { "Content-Type": "application/json", "Authorization": `Bearer ${embeddingApiKey}` },
                 body: JSON.stringify(body),
             });
             if (!response.ok) {
-                console.log("[Hypirk] Batch embedding fetch failed, status:", response.status);
-                return texts.map(() => null);
+                console.log("[Hypirk] Voyage contextual embedding failed, status:", response.status);
+                return groups.map(() => null);
             }
-            const data = await response.json();
-            // OpenAI format: { data: [{ embedding: [...] }, ...] }
-            if (data.data && Array.isArray(data.data)) {
-                const result = data.data.map((item) => {
-                    const emb = item?.embedding;
-                    return Array.isArray(emb) && emb.length > 0 ? emb : null;
-                });
-                const successful = result.filter((item) => item !== null);
-                return result;
+            const payload = await response.json();
+            if (!Array.isArray(payload?.data) || payload.data.length !== groups.length)
+                return groups.map(() => null);
+            const ordered = Array(groups.length).fill(null);
+            let dimensions;
+            for (const resultGroup of payload.data) {
+                const groupIndex = resultGroup?.index;
+                if (!Number.isInteger(groupIndex) || groupIndex < 0 || groupIndex >= groups.length || ordered[groupIndex] !== null ||
+                    !Array.isArray(resultGroup?.data) || resultGroup.data.length !== groups[groupIndex].length)
+                    return groups.map(() => null);
+                const vectors = Array(groups[groupIndex].length).fill(null);
+                for (const resultChunk of resultGroup.data) {
+                    const chunkIndex = resultChunk?.index;
+                    const vector = resultChunk?.embedding;
+                    if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= vectors.length || vectors[chunkIndex] !== null ||
+                        !isFiniteEmbeddingVector(vector, dimensions))
+                        return groups.map(() => null);
+                    dimensions ??= vector.length;
+                    vectors[chunkIndex] = vector;
+                }
+                if (vectors.some(vector => !vector))
+                    return groups.map(() => null);
+                ordered[groupIndex] = vectors;
             }
-            return texts.map(() => null);
+            return ordered.every(group => group !== null) ? ordered : groups.map(() => null);
         }
-        catch (e) {
-            console.log("[Hypirk] Batch embedding fetch error:", e);
-            return texts.map(() => null);
+        catch (error) {
+            console.log("[Hypirk] Voyage contextual embedding error:", error);
+            return groups.map(() => null);
         }
     }
-    // Shared mechanics; each lane retains its own text surface and scoring policy.
-    async function ensureCandidateEmbeddings(candidates, { configHash, dimensions, readCache, writeCache }) {
+    /** Batch whole contextual groups without separating their chunks. */
+    async function getContextualEmbeddingGroups(groups, inputType = null) {
+        const output = Array(groups.length).fill(null);
+        const batches = [];
+        let batch = [], batchTokens = 0, batchChunks = 0;
+        const totalTokenLimit = getContextualEmbeddingModel() === "voyage-context-4" ? 32000 : EMBEDDING_BATCH_TOKEN_LIMIT;
+        for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+            const group = groups[groupIndex];
+            const tokens = await Promise.all(group.map(text => countTokens(text)));
+            const groupTokens = tokens.reduce((sum, value) => sum + value, 0);
+            if (!group.length || group.length > 16000 || groupTokens > 32000)
+                continue;
+            if (batch.length && (batchTokens + groupTokens > totalTokenLimit || batch.length >= 1000 || batchChunks + group.length > 16000)) {
+                batches.push(batch); batch = []; batchTokens = 0; batchChunks = 0;
+            }
+            batch.push({ groupIndex, group });
+            batchTokens += groupTokens;
+            batchChunks += group.length;
+        }
+        if (batch.length)
+            batches.push(batch);
+        for (const current of batches) {
+            const results = await getBatchContextualEmbeddings(current.map(item => item.group), inputType);
+            current.forEach((item, index) => { output[item.groupIndex] = results[index]; });
+        }
+        return output;
+    }
+    function readDialogueEmbedding(node) {
+        return node.dialogueEmbeddingChildren?.length === 1 ? node.dialogueEmbeddingChildren[0].embedding : null;
+    }
+    /** Both lanes share a source hash so a change in either rebuilds the full document group. */
+    async function ensureNodeContextualEmbeddings(candidates, dimensions) {
+        const configHash = await getNodeEmbeddingConfigHash();
         const statuses = new Map();
         const missing = [];
         for (const candidate of candidates) {
-            const text = candidate.text ?? candidate.memoryText;
-            if (!text) { statuses.set(candidate, "empty-node"); continue; }
-            const cache = readCache(candidate);
-            if (cache?.sourceHash === candidate.sourceHash && cache?.configHash === configHash &&
-                isFiniteEmbeddingVector(cache.embedding, dimensions)) {
-                candidate.embedding = cache.embedding;
+            candidate.lanes = [candidate.narration, candidate.dialogue].filter(Boolean);
+            if (candidate.lanes.length === 0) {
+                statuses.set(candidate, "empty-node");
+                continue;
+            }
+            const node = candidate.node;
+            const dialogue = readDialogueEmbedding(node);
+            const sharedCache = node.embeddingSourceHash === candidate.sourceHash &&
+                node.dialogueEmbeddingSourceHash === candidate.sourceHash &&
+                node.embeddingConfigHash === configHash && node.dialogueEmbeddingConfigHash === configHash;
+            const narrationMatches = candidate.narration
+                ? isFiniteEmbeddingVector(node.embedding, dimensions)
+                : !node.embedding;
+            const dialogueMatches = candidate.dialogue
+                ? node.dialogueEmbeddingChildren?.length === 1 &&
+                    node.dialogueEmbeddingChildren[0].sourceHash === candidate.sourceHash &&
+                    isFiniteEmbeddingVector(dialogue, dimensions)
+                : !dialogue && !node.dialogueEmbeddingChildren?.length;
+            if (sharedCache && narrationMatches && dialogueMatches) {
+                candidate.narrationEmbedding = candidate.narration ? node.embedding : null;
+                candidate.dialogueEmbedding = candidate.dialogue ? dialogue : null;
                 statuses.set(candidate, "ok");
             }
-            else missing.push(candidate);
+            else
+                missing.push(candidate);
         }
-        const batches = [];
-        let batch = [], tokens = 0;
-        for (const candidate of missing) {
-            const cost = await countTokens(candidate.text ?? candidate.memoryText);
-            if (batch.length && tokens + cost > EMBEDDING_BATCH_TOKEN_LIMIT) {
-                batches.push(batch); batch = []; tokens = 0;
+        const vectors = await getContextualEmbeddingGroups(missing.map(candidate => candidate.lanes), "document");
+        missing.forEach((candidate, index) => {
+            const groupVectors = vectors[index];
+            if (!groupVectors || groupVectors.length !== candidate.lanes.length ||
+                groupVectors.some(vector => !isFiniteEmbeddingVector(vector, dimensions))) {
+                statuses.set(candidate, "node-failed");
+                return;
             }
-            batch.push(candidate); tokens += cost;
-        }
-        if (batch.length) batches.push(batch);
-        for (const batch of batches) {
-            const vectors = await getBatchEmbeddings(batch.map(candidate => candidate.text ?? candidate.memoryText));
-            batch.forEach((candidate, index) => {
-                const embedding = vectors[index];
-                if (!isFiniteEmbeddingVector(embedding, dimensions)) {
-                    statuses.set(candidate, "node-failed"); return;
-                }
-                candidate.embedding = embedding;
-                writeCache(candidate, { embedding, sourceHash: candidate.sourceHash, configHash });
-                statuses.set(candidate, "ok");
-            });
-        }
+            let laneIndex = 0;
+            candidate.narrationEmbedding = candidate.narration ? groupVectors[laneIndex++] : null;
+            candidate.dialogueEmbedding = candidate.dialogue ? groupVectors[laneIndex] : null;
+            const node = candidate.node;
+            if (candidate.narration)
+                node.embedding = candidate.narrationEmbedding;
+            else
+                delete node.embedding;
+            if (candidate.dialogue)
+                node.dialogueEmbeddingChildren = [{ sourceHash: candidate.sourceHash, embedding: candidate.dialogueEmbedding }];
+            else
+                delete node.dialogueEmbeddingChildren;
+            node.embeddingSourceHash = candidate.sourceHash;
+            node.dialogueEmbeddingSourceHash = candidate.sourceHash;
+            node.embeddingConfigHash = configHash;
+            node.dialogueEmbeddingConfigHash = configHash;
+            delete node.embeddingChildren;
+            delete node.embeddingConfig;
+            markEmbeddingCacheDirty();
+            statuses.set(candidate, "ok");
+        });
         return statuses;
     }
     function cosineSimilarity(a, b) {
@@ -2952,7 +3027,7 @@ Return JSON only in this exact shape:
         }
         return {
             format: "hypirk-local-embedding-cache",
-            schemaVersion: 1,
+            schemaVersion: 2,
             charId,
             chatId,
             memories,
@@ -3010,7 +3085,7 @@ Return JSON only in this exact shape:
                 storage.getItem(getLocalEmbeddingCacheKey(charId, chatId)),
                 storage.getItem(getLocalDerivedCacheKey(charId, chatId)),
             ]);
-            const valid = saved?.format === "hypirk-local-embedding-cache" && saved.schemaVersion === 1 &&
+            const valid = saved?.format === "hypirk-local-embedding-cache" && saved.schemaVersion === 2 &&
                 saved.charId === charId && saved.chatId === chatId && saved.memories && typeof saved.memories === "object";
             if (valid) {
                 for (const memory of getNodes()) {
@@ -3944,7 +4019,7 @@ Return JSON only in this exact shape:
                     paragraphCount: slice.length,
                 });
             }
-            const messageWeight = (messageIndex + 1) / messageCount;
+            const messageWeight = messageIndex === messageCount - 1 ? 1.5 : 1;
             groups.forEach((group, partIndex) => weighted.push({
                 text: group.text,
                 // Preserve the message's total weight while avoiding overweighting
@@ -5052,7 +5127,7 @@ Return JSON only in this exact shape:
         // Separate favorites — they always get included regardless of score
         const favorites = allNodes.filter((n) => n.favorite && !excludedIds.has(n.id));
         const nonFavorites = allNodes.filter((n) => !n.favorite && !excludedIds.has(n.id));
-        // Compute similarity scores with batched embeddings if configured
+        // Compute similarity scores with contextualized Voyage embeddings if configured
         const similarityScores = new Map();
         const dialogueEmbeddingScores = new Map();
         const dialogueEmbeddingMatches = new Map();
@@ -5063,30 +5138,70 @@ Return JSON only in this exact shape:
         const embeddingStatusByNode = new Map();
         let currentDialogueBundle = buildCurrentDialogueEmbeddingBundle(currentDialogues);
         let currentDialogueBundleEmbedding = null;
-        if (!embeddingUrl) {
+        let contextualCandidates = [];
+        if (!hasEmbeddingConfiguration()) {
             for (const node of nonFavorites)
                 embeddingStatusByNode.set(node.id, "not-configured");
         }
-        if (embeddingUrl && nonFavorites.length > 0) {
+        if (hasEmbeddingConfiguration() && nonFavorites.length > 0) {
             const requestedQueries = expandedQueries.length > 0
                 ? expandedQueries
                 : [{ text: query, weight: 1, partIndex: 0, partCount: 1 }];
             currentDialogueBundle = buildCurrentDialogueEmbeddingBundle(currentDialogues);
-            // Query fragments and the current dialogue bundle share one embedding HTTP batch.
-            const queryBatchTexts = [
-                ...requestedQueries.map((item) => item.text),
-                ...(currentDialogueBundle ? [currentDialogueBundle] : []),
-            ];
-            const queryBatchEmbeddings = await getBatchEmbeddings(queryBatchTexts);
-            const queryEmbResult = queryBatchEmbeddings.slice(0, requestedQueries.length);
-            currentDialogueBundleEmbedding = currentDialogueBundle
-                ? queryBatchEmbeddings[requestedQueries.length]
-                : null;
+            // Keep each source message's paragraph chunks together. Voyage recommends
+            // singleton query groups with input_type=query; grouped message chunks need
+            // their shared context, so this request intentionally omits input_type.
+            const queryGroups = [];
+            const groupByMessage = new Map();
+            const sourceGroups = querySources.length > 0 ? querySources : [{
+                sourceMessageIndex: undefined,
+                sourceRole: undefined,
+                originalParagraphCount: countQueryParagraphs(query),
+                processedParagraphCount: countQueryParagraphs(query),
+            }];
+            for (const source of sourceGroups) {
+                const group = { sourceMessageIndex: source.sourceMessageIndex, sourceRole: source.sourceRole, queryIndices: [], chunks: [] };
+                groupByMessage.set(source.sourceMessageIndex, group);
+                queryGroups.push(group);
+            }
+            requestedQueries.forEach((item, queryIndex) => {
+                let group = groupByMessage.get(item.sourceMessageIndex);
+                if (!group) {
+                    group = { sourceMessageIndex: item.sourceMessageIndex, sourceRole: item.sourceRole, queryIndices: [], chunks: [] };
+                    groupByMessage.set(item.sourceMessageIndex, group);
+                    queryGroups.push(group);
+                }
+                group.queryIndices.push(queryIndex);
+                group.chunks.push(item.text);
+            });
+            let dialogueChunkIndex = -1;
+            if (currentDialogueBundle) {
+                let latestGroup = queryGroups[queryGroups.length - 1];
+                if (!latestGroup) {
+                    latestGroup = { sourceMessageIndex: undefined, sourceRole: undefined, queryIndices: [], chunks: [] };
+                    queryGroups.push(latestGroup);
+                }
+                dialogueChunkIndex = latestGroup.chunks.length;
+                latestGroup.chunks.push(currentDialogueBundle);
+            }
+            const groupedQueryEmbeddings = await getContextualEmbeddingGroups(queryGroups.map(group => group.chunks));
+            const queryEmbResult = Array(requestedQueries.length).fill(null);
+            queryGroups.forEach((group, groupIndex) => {
+                const vectors = groupedQueryEmbeddings[groupIndex];
+                if (!vectors)
+                    return;
+                group.queryIndices.forEach((queryIndex, chunkIndex) => { queryEmbResult[queryIndex] = vectors[chunkIndex]; });
+                if (group === queryGroups[queryGroups.length - 1] && dialogueChunkIndex >= 0)
+                    currentDialogueBundleEmbedding = vectors[dialogueChunkIndex] ?? null;
+            });
             const firstQueryEmbedding = queryEmbResult.find((embedding) => isFiniteEmbeddingVector(embedding));
-            if (isFiniteEmbeddingVector(firstQueryEmbedding)) {
-                const validQueries = requestedQueries
-                    .map((item, index) => ({ ...item, embedding: queryEmbResult[index] }))
-                    .filter((item) => isFiniteEmbeddingVector(item.embedding, firstQueryEmbedding.length));
+            const dialogueQueryEmbedding = isFiniteEmbeddingVector(currentDialogueBundleEmbedding) ? currentDialogueBundleEmbedding : null;
+            if (firstQueryEmbedding || dialogueQueryEmbedding) {
+                const validQueries = firstQueryEmbedding
+                    ? requestedQueries
+                        .map((item, index) => ({ ...item, embedding: queryEmbResult[index] }))
+                        .filter((item) => isFiniteEmbeddingVector(item.embedding, firstQueryEmbedding.length))
+                    : [];
                 const validWeightTotal = validQueries.reduce((sum, item) => sum + item.weight, 0) || 1;
                 for (const item of validQueries)
                     item.weight /= validWeightTotal;
@@ -5102,7 +5217,7 @@ Return JSON only in this exact shape:
                         }];
                 lastEmbeddingRetrievalTrace = {
                     createdAt: Date.now(),
-                    mode: "query-separated",
+                    mode: "contextual-message-groups",
                     paragraphGroupSize: Math.max(1, Math.floor(queryParagraphGroupSize)),
                     sources: traceSources,
                     queries: validQueries.map((item) => ({
@@ -5115,32 +5230,25 @@ Return JSON only in this exact shape:
                     })),
                     nodes: {},
                 };
-                const configHash = await getNodeEmbeddingConfigHash();
-                const candidates = await Promise.all(nonFavorites.map(async (node) => {
-                    const memoryText = buildNodeEmbeddingText(node);
+                contextualCandidates = await Promise.all(nonFavorites.map(async (node) => {
+                    const narration = buildNodeEmbeddingText(node);
+                    const dialogue = buildNodeDialogueEmbeddingBundle(node);
                     return {
                         node,
-                        memoryText,
-                        sourceHash: await hashMessageContent(memoryText),
+                        narration,
+                        dialogue,
+                        memoryText: narration,
+                        sourceHash: await hashMessageContent(JSON.stringify([narration, dialogue])),
                     };
                 }));
-                const statuses = await ensureCandidateEmbeddings(candidates, {
-                    configHash, dimensions: firstQueryEmbedding.length,
-                    readCache: ({ node }) => ({ embedding: node.embedding,
-                        sourceHash: node.embeddingSourceHash, configHash: node.embeddingConfigHash }),
-                    writeCache: ({ node }, cache) => {
-                        node.embedding = cache.embedding;
-                        node.embeddingSourceHash = cache.sourceHash;
-                        node.embeddingConfigHash = cache.configHash;
-                        delete node.embeddingChildren;
-                        delete node.embeddingConfig;
-                        markEmbeddingCacheDirty();
-                    },
-                });
-                for (const candidate of candidates)
+                const dimensions = firstQueryEmbedding?.length ?? dialogueQueryEmbedding.length;
+                const statuses = await ensureNodeContextualEmbeddings(contextualCandidates, dimensions);
+                for (const candidate of contextualCandidates)
                     embeddingStatusByNode.set(candidate.node.id, statuses.get(candidate));
                 const rankedNodes = [];
-                for (const candidate of candidates) {
+                for (const candidate of contextualCandidates) {
+                    if (!validQueries.length)
+                        break;
                     if (embeddingStatusByNode.get(candidate.node.id) !== "ok")
                         continue;
                     const vector = candidate.node.embedding;
@@ -5180,7 +5288,7 @@ Return JSON only in this exact shape:
             }
         }
         // Semantic dialogue lane: one current dialogue bundle vs one cached dialogue bundle per Memory.
-        if (!embeddingUrl) {
+        if (!hasEmbeddingConfiguration()) {
             for (const node of nonFavorites)
                 dialogueEmbeddingStatusByNode.set(node.id, "not-configured");
         }
@@ -5190,38 +5298,14 @@ Return JSON only in this exact shape:
                 : null;
             if (dialogueReferenceEmbedding) {
                 dialogueEmbeddingQueryCount = 1;
-                const dialogueConfigHash = await getDialogueEmbeddingConfigHash();
-                const candidates = await Promise.all(nonFavorites.map(async (node) => {
-                    const text = buildNodeDialogueEmbeddingBundle(node);
-                    return {
-                        node,
-                        text,
-                        sourceHash: await hashMessageContent(text),
-                    };
-                }));
-                const statuses = await ensureCandidateEmbeddings(candidates, {
-                    configHash: dialogueConfigHash, dimensions: dialogueReferenceEmbedding.length,
-                    readCache: ({ node }) => node.dialogueEmbeddingChildren?.length === 1 &&
-                        node.dialogueEmbeddingChildren[0].sourceHash === node.dialogueEmbeddingSourceHash
-                        ? { embedding: node.dialogueEmbeddingChildren[0].embedding,
-                            sourceHash: node.dialogueEmbeddingSourceHash, configHash: node.dialogueEmbeddingConfigHash }
-                        : null,
-                    writeCache: ({ node }, cache) => {
-                        // Preserve the existing cache schema; one bundle occupies this slot.
-                        node.dialogueEmbeddingChildren = [{ sourceHash: cache.sourceHash, embedding: cache.embedding }];
-                        node.dialogueEmbeddingSourceHash = cache.sourceHash;
-                        node.dialogueEmbeddingConfigHash = cache.configHash;
-                        markEmbeddingCacheDirty();
-                    },
-                });
-                for (const candidate of candidates) {
-                    dialogueEmbeddingChildCountByNode.set(candidate.node.id, candidate.text ? 1 : 0);
-                    dialogueEmbeddingStatusByNode.set(candidate.node.id, statuses.get(candidate));
+                for (const candidate of contextualCandidates) {
+                    dialogueEmbeddingChildCountByNode.set(candidate.node.id, candidate.dialogue ? 1 : 0);
+                    dialogueEmbeddingStatusByNode.set(candidate.node.id, embeddingStatusByNode.get(candidate.node.id) ?? "node-failed");
                 }
-                for (const candidate of candidates) {
+                for (const candidate of contextualCandidates) {
                     if (dialogueEmbeddingStatusByNode.get(candidate.node.id) !== "ok")
                         continue;
-                    const vector = candidate.node.dialogueEmbeddingChildren?.[0]?.embedding;
+                    const vector = candidate.dialogueEmbedding;
                     if (!isFiniteEmbeddingVector(vector, dialogueReferenceEmbedding.length)) {
                         dialogueEmbeddingStatusByNode.set(candidate.node.id, "node-failed");
                         continue;
@@ -5230,7 +5314,7 @@ Return JSON only in this exact shape:
                     dialogueEmbeddingScores.set(candidate.node.id, score);
                     dialogueEmbeddingMatches.set(candidate.node.id, {
                         currentDialogue: currentDialogueBundle,
-                        storedDialogue: candidate.text,
+                        storedDialogue: candidate.dialogue,
                         score,
                     });
                 }
@@ -5240,10 +5324,10 @@ Return JSON only in this exact shape:
                     dialogueEmbeddingStatusByNode.set(node.id, "query-failed");
             }
         }
-        else {
-            for (const node of nonFavorites)
-                dialogueEmbeddingStatusByNode.set(node.id, currentDialogueBundle ? "not-configured" : "empty-node");
-        }
+            else {
+                for (const node of nonFavorites)
+                    dialogueEmbeddingStatusByNode.set(node.id, currentDialogueBundle ? "not-configured" : "empty-node");
+            }
         // Score each non-favorite node. 좋아요 is a separate, wall-clock-decaying preference signal.
         const scoreNow = Date.now();
         const scored = [];
@@ -5268,12 +5352,12 @@ Return JSON only in this exact shape:
                 dialogueMatch: dialogueMatch?.provenance,
                 dialogueEmbedding,
                 dialogueEmbeddingContribution,
-                dialogueEmbeddingStatus: dialogueEmbeddingStatusByNode.get(node.id) ?? (embeddingUrl ? "empty-node" : "not-configured"),
+                dialogueEmbeddingStatus: dialogueEmbeddingStatusByNode.get(node.id) ?? (hasEmbeddingConfiguration() ? "empty-node" : "not-configured"),
                 dialogueEmbeddingMatch: dialogueEmbeddingMatches.get(node.id),
                 activationCue,
                 activationCueContribution,
                 activationCueMatch: activationMatch?.provenance,
-                embeddingStatus: embeddingStatusByNode.get(node.id) ?? (embeddingUrl ? "node-failed" : "not-configured"),
+                embeddingStatus: embeddingStatusByNode.get(node.id) ?? (hasEmbeddingConfiguration() ? "node-failed" : "not-configured"),
                 likeBonus,
                 combined: similarityScore + dialogueContribution + dialogueEmbeddingContribution + activationCueContribution + likeBonus,
             });
@@ -5546,9 +5630,9 @@ Return JSON only in this exact shape:
     async function getLorebookEmbeddingConfigHash() {
         return hashMessageContent([
             `lorebook-embedding-schema:${LOREBOOK_EMBEDDING_SCHEMA_VERSION}`,
-            "lorebook-embedding-text-mode:whole-content-without-decorators-v1",
-            embeddingUrl,
-            embeddingModel,
+            `model:${getContextualEmbeddingModel() ?? "invalid"}`,
+            `endpoint:${VOYAGE_CONTEXTUAL_EMBEDDINGS_URL}`,
+            "lorebook-input-type:document-singleton-v1",
         ].join("\u0000"));
     }
     async function loadLorebookEmbeddingCache() {
@@ -5558,7 +5642,7 @@ Return JSON only in this exact shape:
         try {
             const saved = await storage.getItem(getLocalLorebookEmbeddingCacheKey(currentCharId, currentChatId));
             if (saved?.format !== "hypirk-local-lorebook-embedding-cache" ||
-                saved?.schemaVersion !== 1 ||
+                saved?.schemaVersion !== 2 ||
                 saved?.charId !== currentCharId ||
                 saved?.chatId !== currentChatId ||
                 !saved?.entries || typeof saved.entries !== "object")
@@ -5582,7 +5666,7 @@ Return JSON only in this exact shape:
             }
             const record = {
                 format: "hypirk-local-lorebook-embedding-cache",
-                schemaVersion: 1,
+                schemaVersion: 2,
                 charId: currentCharId,
                 chatId: currentChatId,
                 entries,
@@ -5601,7 +5685,7 @@ Return JSON only in this exact shape:
         const contexts = new Map();
         for (const target of targets)
             contexts.set(target, "");
-        if (targets.size === 0 || !embeddingUrl || maxLorebookTokens <= 0)
+        if (targets.size === 0 || !hasEmbeddingConfiguration() || maxLorebookTokens <= 0)
             return contexts;
         const lores = await readCurrentLorebookEntriesForRetrieval();
         const candidates = [];
@@ -5628,7 +5712,8 @@ Return JSON only in this exact shape:
         const query = normalizeEmbeddingWhitespace(retrievalInputs.embeddingQuery || fallbackQuery);
         if (!query)
             return contexts;
-        const [queryEmbedding] = await getBatchEmbeddings([query]);
+        const [queryGroup] = await getContextualEmbeddingGroups([[query]], "query");
+        const queryEmbedding = queryGroup?.[0] ?? null;
         if (!isFiniteEmbeddingVector(queryEmbedding))
             return contexts;
         const configHash = await getLorebookEmbeddingConfigHash();
@@ -5636,10 +5721,24 @@ Return JSON only in this exact shape:
         const liveIds = new Set(lores.map(lore => lore.uid));
         const nextCache = Object.fromEntries(Object.entries(cached?.entries ?? {}).filter(([id]) => liveIds.has(id)));
         let cacheChanged = Object.keys(nextCache).length !== Object.keys(cached?.entries ?? {}).length;
-        await ensureCandidateEmbeddings(candidates, {
-            configHash, dimensions: queryEmbedding.length,
-            readCache: candidate => cached?.entries?.[candidate.lore.uid],
-            writeCache: (candidate, cache) => { nextCache[candidate.lore.uid] = cache; cacheChanged = true; },
+        const missing = [];
+        for (const candidate of candidates) {
+            const cache = cached?.entries?.[candidate.lore.uid];
+            if (cache?.sourceHash === candidate.sourceHash && cache?.configHash === configHash &&
+                isFiniteEmbeddingVector(cache.embedding, queryEmbedding.length)) {
+                candidate.embedding = cache.embedding;
+            }
+            else
+                missing.push(candidate);
+        }
+        const documentGroups = await getContextualEmbeddingGroups(missing.map(candidate => [candidate.content]), "document");
+        missing.forEach((candidate, index) => {
+            const embedding = documentGroups[index]?.[0];
+            if (!isFiniteEmbeddingVector(embedding, queryEmbedding.length))
+                return;
+            candidate.embedding = embedding;
+            nextCache[candidate.lore.uid] = { embedding, sourceHash: candidate.sourceHash, configHash };
+            cacheChanged = true;
         });
         if (isCurrentOperation(owner) && cacheChanged) await saveLorebookEmbeddingCache(nextCache);
         const separator = resolveInjectionText(lorebookSeparator);
