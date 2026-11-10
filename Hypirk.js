@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.8
+//@version 0.1.9
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.8";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.9";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -1001,7 +1001,6 @@ Return JSON only in this exact shape:
     let lastRawMessagesMissingChatId = 0;
     let currentLinkHealthStatus = "no-links";
     let linkRecoveryIdentityConfirmed = true;
-    let linkFallbackBoundaryAllowed = false;
     const SETFULLCHAT_DEBUG_LOG_LIMIT = 200;
     const setFullChatDebugLog = [];
     const setFullChatModuleMatchCache = new Map();
@@ -1230,10 +1229,10 @@ Return JSON only in this exact shape:
                 const chatId = typeof msg.chatId === "string" ? msg.chatId : String(msg.chatId ?? "");
                 if (content && !chatId)
                     messagesMissingChatId += 1;
-                if (content && chatId) {
-                    messages.push({ chatId, index, role, content });
+                if (chatId)
                     indexByChatId.set(chatId, index);
-                }
+                if (content && chatId)
+                    messages.push({ chatId, index, role, content });
             }
             messageIndexByChatId = indexByChatId;
             currentRawMessages = messages;
@@ -1256,7 +1255,8 @@ Return JSON only in this exact shape:
     }
     async function registerMessages(messages) {
         const slots = [];
-        for (const message of messages) {
+        const anchors = await createMessageAnchors(messages);
+        for (const [position, message] of messages.entries()) {
             const existing = Object.entries(state.messages).find(([, record]) => record.chatId === message.chatId);
             let slot = existing ? Number(existing[0]) : message.index;
             if (!existing && state.messages[String(slot)]) {
@@ -1264,354 +1264,145 @@ Return JSON only in this exact shape:
             }
             state.messages[String(slot)] = {
                 chatId: message.chatId, index: message.index,
-                anchor: state.hashRecoveryEnabled === true && message.index !== -1
-                    ? await createMessageAnchor(message)
-                    : null,
+                anchor: existing?.[1].anchor ?? anchors[position],
             };
             slots.push(slot);
         }
         return [...new Set(slots)];
     }
-    async function backfillMessageAnchors(messages) {
-        if (!linkRecoveryIdentityConfirmed || state.hashRecoveryEnabled !== true)
-            return 0;
-        const byId = new Map(messages.map(message => [message.chatId, message]));
-        let added = 0;
-        for (const record of getRealMessageRefPointers()) {
-            const message = byId.get(record.chatId);
-            if (message && !record.anchor) {
-                record.anchor = await createMessageAnchor(message);
-                added++;
-            }
-        }
-        return added;
-    }
     function updateLastVerifiedSummarizedIndex() {
-        const resolved = getResolvedLastSummarizedMsgIndex();
-        if (resolved < 0 || state.lastVerifiedSummarizedIndex === resolved)
+        const resolved = getLastSummarizedMsgIndex();
+        if (state.lastVerifiedSummarizedIndex === resolved)
             return false;
         state.lastVerifiedSummarizedIndex = resolved;
         return true;
     }
-    async function tryBootstrapSetFullChatRewrite(messages, pointers, directResolved, directRatio) {
-        if (state.hashRecoveryEnabled === true || pointers.length === 0)
-            return false;
-        // The observed RisuAI setFullChat bug rewrites every message chatId while
-        // preserving the chat room, array order and indices. Stay deliberately
-        // strict here: this bootstrap path is only for that all-IDs-rewritten shape.
-        if (directResolved.length !== 0) {
-            pushSetFullChatDebug("bootstrap-skip-partial-direct-match", {
-                pointerCount: pointers.length,
-                directResolvedCount: directResolved.length,
-                directRatio,
-            });
-            return false;
+    async function recoverRewrittenMessageLinks(pointers, messages) {
+        if (pointers.length === 0 || messages.length === 0)
+            return new Map();
+
+        const anchors = await createMessageAnchors(messages);
+        const candidatesByIndex = new Map();
+        const candidatesByFingerprint = new Map();
+        for (const [position, message] of messages.entries()) {
+            const anchor = anchors[position];
+            if (!anchor)
+                continue;
+            candidatesByIndex.set(message.index, { message, anchor });
+            const key = messageFingerprintKey(anchor.role, anchor.contentLength, anchor.contentHash);
+            const group = candidatesByFingerprint.get(key) ?? [];
+            group.push(message);
+            candidatesByFingerprint.set(key, group);
         }
-        const luaScan = await scanCurrentSetFullChatLua(false);
-        pushSetFullChatDebug("lua-scan-auto", {
-            detected: luaScan.detected,
-            detectionMode: luaScan.detectionMode,
-            characterScanned: luaScan.characterScanned,
-            moduleScan: luaScan.moduleScan,
-            matches: luaScan.matches.map(match => ({
-                source: match.source,
-                sourceName: match.sourceName,
-                sourceId: match.sourceId,
-                triggerName: match.triggerName,
-                triggerType: match.triggerType,
-                lineNumbers: match.lineNumbers,
-                matchCount: match.matchCount,
-            })),
-        });
-        if (!luaScan.detected) {
-            pushSetFullChatDebug("bootstrap-rejected-no-setfullchat-lua", {
-                pointerCount: pointers.length,
-                directRatio,
-            });
-            return false;
-        }
-        const messagesByIndex = new Map(messages.map(message => [message.index, message]));
-        const assignments = [];
-        const targetChatIds = new Set();
-        try {
-            for (const pointer of pointers) {
-                const candidate = messagesByIndex.get(pointer.index);
-                if (!candidate || !candidate.chatId || targetChatIds.has(candidate.chatId)) {
-                    pushSetFullChatDebug("bootstrap-rejected-index-shape", {
-                        pointerCount: pointers.length,
-                        directRatio,
-                        failedIndex: pointer.index,
-                        candidateFound: Boolean(candidate),
-                        candidateHasChatId: Boolean(candidate?.chatId),
-                        duplicateTargetChatId: Boolean(candidate?.chatId && targetChatIds.has(candidate.chatId)),
-                    });
-                    return false;
-                }
-                targetChatIds.add(candidate.chatId);
-                assignments.push({
-                    pointer,
-                    message: candidate,
-                    anchor: await createMessageAnchor(candidate),
-                });
+
+        const recovered = new Map();
+        const usedChatIds = new Set();
+        for (const pointer of pointers) {
+            const candidate = candidatesByIndex.get(pointer.anchor.sourceIndex);
+            if (candidate && !usedChatIds.has(candidate.message.chatId) &&
+                anchorMatchesMessage(pointer.anchor, candidate.message, candidate.anchor.contentHash)) {
+                recovered.set(pointer, candidate.message);
+                usedChatIds.add(candidate.message.chatId);
             }
         }
-        catch (error) {
-            pushSetFullChatDebug("bootstrap-rejected-hash-error", {
-                pointerCount: pointers.length,
-                error: String(error),
-            });
-            return false;
+        // A deletion can shift surviving messages. Resolve shifted matches only
+        // when the fingerprint identifies one stored link and one live candidate.
+        const storedFingerprintCounts = new Map();
+        for (const pointer of pointers) {
+            const { role, contentLength, contentHash } = pointer.anchor;
+            const key = messageFingerprintKey(role, contentLength, contentHash);
+            storedFingerprintCounts.set(key, (storedFingerprintCounts.get(key) ?? 0) + 1);
         }
-        const mapping = assignments.map(({ pointer, message }) => ({
-            index: pointer.index,
-            oldChatId: pointer.chatId,
-            newChatId: message.chatId,
-        }));
-        for (const { pointer, message, anchor } of assignments) {
-            pointer.chatId = message.chatId;
-            pointer.index = message.index;
-            pointer.anchor = anchor;
+        for (const pointer of pointers) {
+            if (recovered.has(pointer))
+                continue;
+            const { role, contentLength, contentHash } = pointer.anchor;
+            const key = messageFingerprintKey(role, contentLength, contentHash);
+            const candidates = candidatesByFingerprint.get(key);
+            if (storedFingerprintCounts.get(key) !== 1 || candidates?.length !== 1)
+                continue;
+            const [candidate] = candidates;
+            if (usedChatIds.has(candidate.chatId))
+                continue;
+            recovered.set(pointer, candidate);
+            usedChatIds.add(candidate.chatId);
         }
-        state.hashRecoveryEnabled = true;
-        state.hashRecoveryActivatedAt = Date.now();
-        currentLinkHealthStatus = "recovered";
-        linkFallbackBoundaryAllowed = true;
-        updateLastVerifiedSummarizedIndex();
-        pushSetFullChatDebug("bootstrap-recovery-success", {
-            pointerCount: pointers.length,
-            directRatioBefore: directRatio,
-            hashRecoveryEnabled: true,
-            hashRecoveryActivatedAt: state.hashRecoveryActivatedAt,
-            mapping,
-        });
-        await saveStateForChat(currentCharId, currentChatId);
-        return true;
+        return recovered;
     }
     async function reconcileMessageLinks(messages) {
         const pointers = getRealMessageRefPointers();
         if (pointers.length === 0) {
             currentLinkHealthStatus = "no-links";
-            linkFallbackBoundaryAllowed = false;
             return;
         }
         if (!linkRecoveryIdentityConfirmed) {
             currentLinkHealthStatus = "identity-mismatch";
-            linkFallbackBoundaryAllowed = false;
             return;
         }
-        const directResolved = pointers.filter((pointer) => messageIndexByChatId.has(pointer.chatId));
-        let indicesChanged = false;
-        for (const record of directResolved) {
-            const index = messageIndexByChatId.get(record.chatId);
-            if (record.index !== index)
-                indicesChanged = true;
-            record.index = index;
-        }
-        const directRatio = directResolved.length / pointers.length;
-        if (messages.length === 0 && lastRawSourceMessageCount > 0) {
-            currentLinkHealthStatus = "unsafe";
-            linkFallbackBoundaryAllowed =
-                lastRawMessagesMissingChatId > 0 &&
-                    typeof state.lastVerifiedSummarizedIndex === "number";
-            return;
-        }
-        if (messages.length === 0) {
-            currentLinkHealthStatus = "partial";
-            linkFallbackBoundaryAllowed = false;
-            if (state.lastVerifiedSummarizedIndex !== -1) {
-                state.lastVerifiedSummarizedIndex = -1;
-                await saveStateForChat(currentCharId, currentChatId);
-            }
-            return;
-        }
-        if (directResolved.length === pointers.length) {
-            currentLinkHealthStatus = "healthy";
-            linkFallbackBoundaryAllowed = true;
-            if (updateLastVerifiedSummarizedIndex() || indicesChanged) {
-                await saveStateForChat(currentCharId, currentChatId);
-            }
-            return;
-        }
-        // A small number of missing IDs normally means that source messages were
-        // actually deleted. Remaining stable IDs are already sufficient and no
-        // content hashing is needed.
-        if (directRatio >= 0.6) {
-            currentLinkHealthStatus = "partial";
-            linkFallbackBoundaryAllowed = true;
-            if (updateLastVerifiedSummarizedIndex() || indicesChanged) {
-                await saveStateForChat(currentCharId, currentChatId);
-            }
-            return;
-        }
-        pushSetFullChatDebug("link-rewrite-candidate", {
-            pointerCount: pointers.length,
-            directResolvedCount: directResolved.length,
-            directRatio,
-            hashRecoveryEnabled: state.hashRecoveryEnabled === true,
-            ownerIdentityConfirmed: linkRecoveryIdentityConfirmed,
-        });
-        if (state.hashRecoveryEnabled !== true) {
-            const bootstrapped = await tryBootstrapSetFullChatRewrite(messages, pointers, directResolved, directRatio);
-            if (bootstrapped)
-                return;
-        }
-        const anchoredPointers = pointers.filter((pointer) => pointer.anchor !== null);
-        if (anchoredPointers.length === 0) {
-            currentLinkHealthStatus = "unanchored";
-            linkFallbackBoundaryAllowed = false;
-            return;
-        }
-        const hashesByIndex = new Map();
-        try {
-            for (const message of messages) {
-                hashesByIndex.set(message.index, await hashMessageContent(message.content));
-            }
-        }
-        catch (error) {
-            currentLinkHealthStatus = "unsafe";
-            linkFallbackBoundaryAllowed = false;
-            return;
-        }
-        const messagesByIndex = new Map(messages.map((message) => [message.index, message]));
-        const usedCurrentIndices = new Set();
-        const resolvedCurrentIndex = new Map();
-        for (const pointer of directResolved) {
-            const currentIndex = messageIndexByChatId.get(pointer.chatId);
-            if (currentIndex === undefined)
+
+        const liveIndices = messageIndexByChatId;
+        const linkedChatIds = new Set(Object.values(state.messages).map(record => record.chatId));
+        const messagesById = new Map(messages.map(message => [message.chatId, message]));
+        const unmatched = [];
+        const missingAnchors = [];
+        let directResolvedCount = 0;
+        let changed = false;
+        for (const pointer of pointers) {
+            const index = liveIndices.get(pointer.chatId);
+            if (index === undefined) {
+                if (pointer.anchor)
+                    unmatched.push(pointer);
                 continue;
-            usedCurrentIndices.add(currentIndex);
-            resolvedCurrentIndex.set(pointer, currentIndex);
-        }
-        const recovered = new Map();
-        let sameIndexRecovered = 0;
-        for (const pointer of anchoredPointers) {
-            if (resolvedCurrentIndex.has(pointer))
-                continue;
-            const candidate = messagesByIndex.get(pointer.anchor.sourceIndex);
-            const candidateHash = candidate ? hashesByIndex.get(candidate.index) : undefined;
-            if (candidate &&
-                candidateHash &&
-                !usedCurrentIndices.has(candidate.index) &&
-                anchorMatchesMessage(pointer.anchor, candidate, candidateHash)) {
-                recovered.set(pointer, candidate);
-                usedCurrentIndices.add(candidate.index);
-                sameIndexRecovered += 1;
             }
-        }
-        // If a source message was deleted, later indices shift. Match only
-        // fingerprints that are unique on both sides; ambiguous duplicate text is
-        // deliberately left orphaned.
-        const currentByFingerprint = new Map();
-        for (const message of messages) {
-            const hash = hashesByIndex.get(message.index);
-            if (!hash)
-                continue;
-            const key = messageFingerprintKey(message.role, message.content.length, hash);
-            const group = currentByFingerprint.get(key);
-            if (group)
-                group.push(message);
-            else
-                currentByFingerprint.set(key, [message]);
-        }
-        const storedFingerprintCounts = new Map();
-        for (const pointer of anchoredPointers) {
-            const key = messageFingerprintKey(pointer.anchor.role, pointer.anchor.contentLength, pointer.anchor.contentHash);
-            storedFingerprintCounts.set(key, (storedFingerprintCounts.get(key) ?? 0) + 1);
-        }
-        for (const pointer of anchoredPointers) {
-            if (resolvedCurrentIndex.has(pointer) || recovered.has(pointer))
-                continue;
-            const key = messageFingerprintKey(pointer.anchor.role, pointer.anchor.contentLength, pointer.anchor.contentHash);
-            const candidates = currentByFingerprint.get(key) ?? [];
-            if (storedFingerprintCounts.get(key) !== 1 || candidates.length !== 1)
-                continue;
-            const candidate = candidates[0];
-            if (usedCurrentIndices.has(candidate.index))
-                continue;
-            recovered.set(pointer, candidate);
-            usedCurrentIndices.add(candidate.index);
-        }
-        const orderedMatches = anchoredPointers
-            .map((pointer) => {
-            const currentIndex = resolvedCurrentIndex.get(pointer) ?? recovered.get(pointer)?.index;
-            return currentIndex === undefined
-                ? null
-                : { sourceIndex: pointer.anchor.sourceIndex, currentIndex };
-        })
-            .filter((match) => match !== null)
-            .sort((a, b) => a.sourceIndex - b.sourceIndex);
-        const monotonic = orderedMatches.every((match, index) => index === 0 || orderedMatches[index - 1].currentIndex < match.currentIndex);
-        const confirmedCount = directResolved.length + recovered.size;
-        const confirmedCurrentIndices = [
-            ...resolvedCurrentIndex.values(),
-            ...[...recovered.values()].map((message) => message.index),
-        ];
-        const confirmedCurrentCount = new Set(confirmedCurrentIndices).size;
-        const lastConfirmedCurrentIndex = confirmedCurrentIndices.length > 0 ? Math.max(...confirmedCurrentIndices) : -1;
-        // When deletion is evidenced below, missing stored anchors may represent
-        // intentionally deleted source messages. In that case, evaluate only the
-        // current messages through the last link we could confirm; newer messages
-        // after that boundary are still unsummarized and must not dilute the ratio.
-        // Without deletion evidence, retain the stricter stored-link denominator.
-        const comparableCurrentCount = messages.filter((message) => message.index <= lastConfirmedCurrentIndex).length;
-        const deletionDetected = messages.length < pointers.length ||
-            (typeof state.lastVerifiedSummarizedIndex === "number" &&
-                state.lastVerifiedSummarizedIndex >= messages.length) ||
-            orderedMatches.some((match) => match.currentIndex < match.sourceIndex);
-        const recoveryDenominator = deletionDetected
-            ? comparableCurrentCount
-            : pointers.length;
-        const recoveryNumerator = deletionDetected
-            ? confirmedCurrentCount
-            : confirmedCount;
-        const confirmedRatio = recoveryDenominator > 0 ? recoveryNumerator / recoveryDenominator : 0;
-        const requiredConfirmedCount = Math.min(3, recoveryDenominator);
-        const accepted = deletionDetected
-            ? monotonic &&
-                recoveryDenominator > 0 &&
-                recoveryNumerator >= requiredConfirmedCount &&
-                confirmedRatio >= 0.8
-            : monotonic &&
-                (pointers.length <= 2
-                    ? confirmedCount === pointers.length && sameIndexRecovered === recovered.size
-                    : confirmedCount >= 3 && confirmedRatio >= 0.8);
-        if (!accepted) {
-            if (state.hashRecoveryEnabled === true) {
-                pushSetFullChatDebug("anchored-recovery-rejected", {
-                    pointerCount: pointers.length,
-                    directResolvedCount: directResolved.length,
-                    directRatio,
-                    recoveredCount: recovered.size,
-                    confirmedCount,
-                    confirmedRatio,
-                    monotonic,
-                    deletionDetected,
-                });
+            directResolvedCount += 1;
+            if (pointer.index !== index) {
+                pointer.index = index;
+                changed = true;
             }
-            currentLinkHealthStatus = "unsafe";
-            linkFallbackBoundaryAllowed = monotonic && confirmedCount > 0;
-            return;
+            const message = messagesById.get(pointer.chatId);
+            if (!pointer.anchor && message)
+                missingAnchors.push({ pointer, message });
         }
+
+        // Only live messages with their own chatId can replace a stored ID.
+        // Stored links with no matching live message remain orphaned.
+        const candidates = unmatched.length
+            ? messages.filter(message => message.chatId && !linkedChatIds.has(message.chatId))
+            : [];
+        const recovered = await recoverRewrittenMessageLinks(unmatched, candidates);
         for (const [pointer, message] of recovered) {
             pointer.chatId = message.chatId;
             pointer.index = message.index;
-            if (pointer.anchor)
-                pointer.anchor.sourceIndex = message.index;
+            pointer.anchor.sourceIndex = message.index;
         }
-        currentLinkHealthStatus = confirmedCount === pointers.length ? "recovered" : "partial";
-        if (state.hashRecoveryEnabled === true) {
+        if (missingAnchors.length) {
+            const anchors = await createMessageAnchors(missingAnchors.map(({ message }) => message));
+            for (const [position, { pointer }] of missingAnchors.entries()) {
+                if (anchors[position] && !pointer.anchor) {
+                    pointer.anchor = anchors[position];
+                    changed = true;
+                }
+            }
+        }
+
+        const resolvedCount = directResolvedCount + recovered.size;
+        currentLinkHealthStatus = resolvedCount < pointers.length
+            ? "partial"
+            : recovered.size ? "recovered" : "healthy";
+        if (recovered.size) {
+            if (state.hashRecoveryEnabled !== true) {
+                state.hashRecoveryEnabled = true;
+                state.hashRecoveryActivatedAt = Date.now();
+            }
             pushSetFullChatDebug("anchored-recovery-success", {
                 pointerCount: pointers.length,
-                directResolvedCount: directResolved.length,
-                directRatioBefore: directRatio,
+                directResolvedCount,
                 recoveredCount: recovered.size,
-                confirmedCount,
                 status: currentLinkHealthStatus,
             });
         }
-        linkFallbackBoundaryAllowed = true;
-        updateLastVerifiedSummarizedIndex();
-        await saveStateForChat(currentCharId, currentChatId);
+        if (updateLastVerifiedSummarizedIndex() || changed || recovered.size)
+            await saveStateForChat(currentCharId, currentChatId);
     }
     async function refreshChatContextForRequestBurst() {
         const now = performance.now();
@@ -2762,7 +2553,7 @@ Return JSON only in this exact shape:
                 hashRecoveryActivatedAt: state.hashRecoveryActivatedAt ?? null,
                 linkHealthStatus: currentLinkHealthStatus,
                 linkRecoveryIdentityConfirmed,
-                linkFallbackBoundaryAllowed,
+                linkFallbackBoundaryAllowed: false,
                 lastVerifiedSummarizedIndex: state.lastVerifiedSummarizedIndex ?? null,
             },
             linkSnapshot: {
@@ -2780,8 +2571,8 @@ Return JSON only in this exact shape:
             sessionLog: [...setFullChatDebugLog],
             notes: [
                 "No message content or Lua source code is included.",
-                "Automatic detection recognizes direct setFullChat(...) call tokens in current-character Lua; module matches are reused after a manual debug scan grants DB access.",
-                "Bootstrap recovery requires zero stored chatId matches and intact stored indices.",
+                "The Lua scan reports direct setFullChat(...) call tokens in current-character Lua and available active modules.",
+                "Recovery requires a matching stored content fingerprint and a live chatId.",
             ],
         };
     }
@@ -2840,29 +2631,11 @@ Return JSON only in this exact shape:
     function getEntryMessageRefCount(entry) {
         return entry.linkedMessages.length;
     }
-    function getResolvedLastSummarizedMsgIndex() {
+    function getLastSummarizedMsgIndex() {
         return Math.max(-1, ...state.entries.flatMap(getEntryMessageIndices));
     }
-    /**
-     * Use the live resolved boundary normally. During an ambiguous same-chat
-     * metadata rewrite, retain the last verified boundary instead of treating
-     * the entire history as newly unsummarized. The fallback is never used for
-     * a cross-chat identity mismatch or when no content anchor matched.
-     */
-    function getLastSummarizedMsgIndex() {
-        const resolved = getResolvedLastSummarizedMsgIndex();
-        if (currentLinkHealthStatus === "unsafe" &&
-            linkFallbackBoundaryAllowed &&
-            typeof state.lastVerifiedSummarizedIndex === "number" &&
-            currentRawMessages.length > 0) {
-            return Math.min(state.lastVerifiedSummarizedIndex, currentRawMessages.length - 1);
-        }
-        return resolved;
-    }
     function isLinkProcessingBlocked() {
-        return (currentLinkHealthStatus === "unsafe" ||
-            currentLinkHealthStatus === "identity-mismatch" ||
-            currentLinkHealthStatus === "unanchored");
+        return currentLinkHealthStatus === "identity-mismatch";
     }
     /**
      * Read pending (unsummarized) messages from chat history on-the-fly.
@@ -3265,7 +3038,6 @@ Return JSON only in this exact shape:
             if (state !== copied || currentCharId !== charId || currentChatId !== chatId)
                 return false;
             linkRecoveryIdentityConfirmed = true;
-            linkFallbackBoundaryAllowed = false;
             await reconcileMessageLinks(await readChatMessagesRaw());
             inheritanceOffer = null;
             invalidateUiSessionRenderData();
@@ -3337,7 +3109,6 @@ Return JSON only in this exact shape:
         stateLoadFailed = false;
         localEmbeddingCacheDirty = false;
         localDerivedCacheDirty = false;
-        let anchorsBackfilled = 0;
         let ownerIdentityMatched = true;
         try {
             await ensureCompactRetrievalLedgerLoaded();
@@ -3447,11 +3218,6 @@ Return JSON only in this exact shape:
                 }
                 const currentMessages = await readChatMessagesRaw();
                 if (linkRecoveryIdentityConfirmed) {
-                    if (state.hashRecoveryEnabled === true) {
-                        anchorsBackfilled = await backfillMessageAnchors(currentMessages);
-                        if (anchorsBackfilled > 0)
-                            migrated = true;
-                    }
                     pushSetFullChatDebug("state-loaded", {
                         hashRecoveryEnabled: state.hashRecoveryEnabled === true,
                         hashRecoveryActivatedAt: state.hashRecoveryActivatedAt ?? null,
@@ -3462,7 +3228,6 @@ Return JSON only in this exact shape:
                 }
                 else {
                     currentLinkHealthStatus = "identity-mismatch";
-                    linkFallbackBoundaryAllowed = false;
                 }
                 if (migrated)
                     await saveStateForChat(charId, chatId);
@@ -3475,7 +3240,6 @@ Return JSON only in this exact shape:
                 state.hashRecoveryEnabled = false;
                 linkRecoveryIdentityConfirmed = true;
                 currentLinkHealthStatus = "no-links";
-                linkFallbackBoundaryAllowed = false;
                 pushSetFullChatDebug("state-created", { hashRecoveryEnabled: false });
             }
         }
@@ -3489,7 +3253,6 @@ Return JSON only in this exact shape:
             state.hashRecoveryEnabled = false;
             linkRecoveryIdentityConfirmed = true;
             currentLinkHealthStatus = "no-links";
-            linkFallbackBoundaryAllowed = false;
         }
         if (!stateLoadFailed)
             await discoverInheritedMemory(charId, chatId);
@@ -4143,10 +3906,7 @@ Return JSON only in this exact shape:
                 const message = slot === -1 && first ? { ...first, chatId: FIRST_MESSAGE_CHAT_ID, index: -1 } : raw.find(message => message.index === slot);
                 if (!message)
                     throw new Error(`연결 메시지 #${slot}을 현재 채팅에서 찾을 수 없습니다.`);
-                nextMessages[String(slot)] = { chatId: message.chatId, index: slot,
-                    anchor: verified.data.hashRecoveryEnabled === true && slot !== -1
-                        ? await createMessageAnchor(message)
-                        : null };
+                nextMessages[String(slot)] = { chatId: message.chatId, index: slot, anchor: null };
             }
         }
         state.entries = nextEntries;
@@ -4168,8 +3928,6 @@ Return JSON only in this exact shape:
         markEmbeddingCacheDirty();
         markDerivedCacheDirty();
         await reconcileMessageLinks(raw);
-        if (state.hashRecoveryEnabled === true)
-            await backfillMessageAnchors(raw);
         await saveState();
         return "hypirk";
     }
