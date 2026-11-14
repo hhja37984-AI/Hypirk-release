@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 1.1.10
+//@version 0.2.0
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -33,7 +33,7 @@
     const REGEX_LIBRARY_STORAGE_KEY = "hypirkproto_regex_library_v1";
     const REGEX_DEFAULTS_VERSION_KEY = "hypirkproto_regex_defaults_version";
     const REGEX_DEFAULTS_VERSION = 1;
-    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.1.9";
+    const DISTRIBUTION_VERSION_LABEL = "Hypirk 0.2.0";
     const HYPIRK_ICON_SVG = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M8 21V3M15 21V3C17.2091 3 19 4.79086 19 7V9C19 11.2091 17.2091 13 15 13M11 3V8C11 9.65685 9.65685 11 8 11C6.34315 11 5 9.65685 5 8V3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
     const DEFAULT_NODE_TRANSLATION_PROMPT = `Translate the supplied Hypirk memory content into the requested target language.
 Preserve all meaning, ambiguity, names, formatting, paragraph order, dialogue speaker names, and quoted dialogue.
@@ -5773,35 +5773,37 @@ Return JSON only in this exact shape:
     }
     /**
      * Injection anchor and memory block are deliberately separate:
-     * - anchor: an existing string in the flattened system prompt
+     * - anchor: an existing string in the flattened request
      * - template: the memory block to insert immediately BEFORE that anchor
      *
-     * The configured anchor is searched in every system message in array order.
+     * The configured anchor is searched in every message in array order.
      * If it is absent, the observed system/history boundary is used as fallback.
      * No alternative anchor is inferred.
      */
-    function injectMemoryAtHistoryBoundary(messages, profile) {
+    function injectMemoryAtHistoryBoundary(messages, profile, hypaContext) {
         const renderedTemplate = renderMemoryInjectionTemplate(profile.template);
         if (!renderedTemplate)
             return "none";
         const anchor = resolveInjectionText(profile.anchor);
         if (anchor.length > 0) {
             for (let i = 0; i < messages.length; i++) {
-                if (messages[i].role !== "system")
-                    continue;
                 const matchIndex = messages[i].content.indexOf(anchor);
                 if (matchIndex < 0)
                     continue;
+                // The later placeholder pass only resolves {{hypa}} in system messages.
+                const block = messages[i].role === "system"
+                    ? renderedTemplate
+                    : replaceAllLiteral(renderedTemplate, HYPA_CONTEXT_PLACEHOLDER, hypaContext);
                 messages[i] = {
                     ...messages[i],
                     content: messages[i].content.slice(0, matchIndex) +
-                        renderedTemplate +
+                        block +
                         messages[i].content.slice(matchIndex),
                 };
                 console.log(`[Hypirk] Memory injected before configured anchor: message=${i}, index=${matchIndex}, matchedLength=${anchor.length}`);
                 return "configured-anchor-before";
             }
-            console.warn(`[Hypirk] Configured memory injection anchor was not found in any system message; using system/history boundary`);
+            console.warn(`[Hypirk] Configured memory injection anchor was not found in any message; using system/history boundary`);
         }
         const boundary = findSystemHistoryBoundary(messages);
         if (!boundary) {
@@ -5913,7 +5915,7 @@ Return JSON only in this exact shape:
                     contexts &&
                     (contexts.hypaContext || contexts.chosenContext));
                 if (shouldInjectMemoryBlock && contexts) {
-                    const memoryInjectionMode = injectMemoryAtHistoryBoundary(messages, requestInjectionProfile);
+                    const memoryInjectionMode = injectMemoryAtHistoryBoundary(messages, requestInjectionProfile, contexts.hypaContext);
                     console.log(`[Hypirk] Memory block injected: ${memoryInjectionMode}`);
                 }
                 if (contexts) {
