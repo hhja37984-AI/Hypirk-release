@@ -1,7 +1,7 @@
 //@name Hypirk
 //@display-name Hypirk
 //@api 3.0
-//@version 0.1.9
+//@version 1.1.10
 //@update-url https://raw.githubusercontent.com/hhja37984-AI/Hypirk-release/main/Hypirk.js
 // ============================================================================
 // Hypirk — RP memory-management plugin
@@ -61,7 +61,6 @@ Return JSON only in this exact shape:
     const LIKE_DECAY_MS = 4 * 24 * 60 * 60 * 1000;
     const DEFAULT_DIALOGUE_LOCAL_WEIGHT = 0.06;
     const DEFAULT_DIALOGUE_EMBEDDING_WEIGHT = 0.08;
-    const DEFAULT_ACTIVATION_CUE_WEIGHT = 0.06;
     const RETRIEVAL_HISTORY_TOP_N = 30;
     const NODE_EMBEDDING_SCHEMA_VERSION = 5;
     const LOREBOOK_EMBEDDING_SCHEMA_VERSION = 2;
@@ -501,7 +500,7 @@ Return JSON only in this exact shape:
             link.id = "hypirk-material-symbols";
             link.rel = "stylesheet";
             link.href =
-                "https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=autorenew,bolt,book_5,cached,check_circle,close,delete,delete_forever,deployed_code,download,edit,experiment,favorite,foggy,help,hourglass_top,list_arrow,lists,menu,move_to_inbox,move_up,note_add,partly_cloudy_day,person_edit,split_scene_2,star,sync_disabled,wand_stars&display=block";
+                "https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&icon_names=autorenew,bolt,book_5,cached,check_circle,close,delete,delete_forever,deployed_code,download,edit,experiment,favorite,foggy,help,hourglass_top,list_arrow,lists,menu,move_to_inbox,move_up,note_add,partly_cloudy_day,person_edit,split_scene_2,sync_disabled,wand_stars&display=block";
             document.head.appendChild(link);
         }
     }
@@ -678,10 +677,9 @@ Return JSON only in this exact shape:
             calendarAgeDays: parseCompactLedgerNumber(parts[10]), content: parseCompactLedgerNumber(parts[11]),
             dialogueSemantic: parseCompactLedgerNumber(parts[12]), dialogueSemanticContribution: parseCompactLedgerNumber(parts[13]),
             dialogueLexical: parseCompactLedgerNumber(parts[14]), dialogueLexicalContribution: parseCompactLedgerNumber(parts[15]),
-            activation: parseCompactLedgerNumber(parts[16]), activationContribution: parseCompactLedgerNumber(parts[17]),
             likeBonus: parseCompactLedgerNumber(parts[18]), total: parseCompactLedgerNumber(parts[19]),
             dialogueSemanticWeight: parseCompactLedgerNumber(parts[20]), dialogueLexicalWeight: parseCompactLedgerNumber(parts[21]),
-            activationWeight: parseCompactLedgerNumber(parts[22]), likeBaseWeight: parseCompactLedgerNumber(parts[23]),
+            likeBaseWeight: parseCompactLedgerNumber(parts[23]),
         };
     }
     async function ensureCompactRetrievalLedgerLoaded() {
@@ -747,7 +745,7 @@ Return JSON only in this exact shape:
     // a summarization preset cannot silently change Similar ranking behavior.
     let dialogueLocalWeight = DEFAULT_DIALOGUE_LOCAL_WEIGHT;
     let dialogueEmbeddingWeight = DEFAULT_DIALOGUE_EMBEDDING_WEIGHT;
-    let activationCueWeight = DEFAULT_ACTIVATION_CUE_WEIGHT;
+    let legacyRetrievalSettings = {};
     let likeBonusBase = DEFAULT_LIKE_BONUS_BASE;
     let recentMemoryRatio = DEFAULT_RECENT_MEMORY_RATIO;
     let memoryInjectionAnchor = DEFAULT_MEMORY_INJECTION_ANCHOR;
@@ -2365,8 +2363,6 @@ Return JSON only in this exact shape:
         return {
             id: (getId ?? nextNodeId)(),
             time: parsed.time ?? "0000-00-00 00:00",
-            category: "",
-            tags: [],
             content: parsed.content,
             createdAt: Date.now(),
         };
@@ -3203,8 +3199,6 @@ Return JSON only in this exact shape:
                 if (refreshStateOwnerNames(charId, chatId))
                     migrated = true;
                 for (const memory of getNodes()) {
-                    if (!Array.isArray(memory.tags))
-                        memory.tags = [];
                     if (memory.likedAt !== undefined && !Number.isFinite(memory.likedAt)) {
                         delete memory.likedAt;
                         migrated = true;
@@ -3328,7 +3322,8 @@ Return JSON only in this exact shape:
                     embeddingApiKey = savedSettings.embeddingApiKey;
                 dialogueLocalWeight = normalizeRetrievalWeight(savedSettings.dialogueLocalWeight, dialogueLocalWeight);
                 dialogueEmbeddingWeight = normalizeRetrievalWeight(savedSettings.dialogueEmbeddingWeight, dialogueEmbeddingWeight);
-                activationCueWeight = normalizeRetrievalWeight(savedSettings.activationCueWeight, activationCueWeight);
+                if (Object.hasOwn(savedSettings, "activationCueWeight"))
+                    legacyRetrievalSettings = { activationCueWeight: savedSettings.activationCueWeight };
                 likeBonusBase = normalizeRetrievalWeight(savedSettings.likeBonusBase, likeBonusBase);
                 if (savedSettings.includeUserMessages !== undefined)
                     includeUserMessages = savedSettings.includeUserMessages;
@@ -3453,7 +3448,7 @@ Return JSON only in this exact shape:
             embeddingApiKey,
             dialogueLocalWeight,
             dialogueEmbeddingWeight,
-            activationCueWeight,
+            ...legacyRetrievalSettings,
             likeBonusBase,
             includeUserMessages,
             embeddingContextMessages,
@@ -4996,51 +4991,6 @@ Return JSON only in this exact shape:
             sharedNgrams,
         };
     }
-    function normalizeActivationText(text) {
-        return String(text ?? "")
-            .normalize("NFKC")
-            .toLocaleLowerCase()
-            .replace(/[\p{P}\p{S}]+/gu, " ")
-            .replace(/\s+/g, " ")
-            .trim();
-    }
-    function activationCuePairScore(cueText, queryText) {
-        const cue = normalizeActivationText(cueText);
-        const query = normalizeActivationText(queryText);
-        if (!cue || !query)
-            return null;
-        const cueTokens = cue.split(" ").filter(Boolean);
-        const queryTokens = query.split(" ").filter(Boolean);
-        if (cueTokens.length === 0 || queryTokens.length === 0)
-            return null;
-        const phrase = query === cue || query.includes(cue);
-        if (phrase)
-            return { score: 1, method: "phrase" };
-        const cueSet = new Set(cueTokens);
-        const querySet = new Set(queryTokens);
-        let shared = 0;
-        for (const token of cueSet)
-            if (querySet.has(token))
-                shared++;
-        if (shared === 0)
-            return null;
-        const score = shared / cueSet.size;
-        return score >= 0.5 ? { score, method: "token coverage" } : null;
-    }
-    function getActivationCueMatch(node, queryTexts) {
-        if (!node.activationCues?.length || queryTexts.length === 0)
-            return null;
-        let best = null;
-        for (const cue of node.activationCues) {
-            for (const queryText of queryTexts) {
-                const match = activationCuePairScore(cue, queryText);
-                if (!match || (best && match.score <= best.score))
-                    continue;
-                best = { score: match.score, provenance: { cue, queryText, method: match.method, score: match.score } };
-            }
-        }
-        return best;
-    }
     function getDialogueLocalMatch(node, currentDialogues) {
         const storedDialogues = extractStructuredContentDialogues(node.content);
         if (currentDialogues.length === 0 || storedDialogues.length === 0)
@@ -5074,9 +5024,7 @@ Return JSON only in this exact shape:
         // Recent memory is calculated before similarity retrieval for every placeholder
         // combination. The selected recent IDs are excluded from the similarity pool.
         const excludedIds = new Set(excludedNodeIds);
-        // Separate favorites — they always get included regardless of score
-        const favorites = allNodes.filter((n) => n.favorite && !excludedIds.has(n.id));
-        const nonFavorites = allNodes.filter((n) => !n.favorite && !excludedIds.has(n.id));
+        const candidates = allNodes.filter((node) => !excludedIds.has(node.id));
         // Compute similarity scores with contextualized Voyage embeddings if configured
         const similarityScores = new Map();
         const dialogueEmbeddingScores = new Map();
@@ -5090,10 +5038,10 @@ Return JSON only in this exact shape:
         let currentDialogueBundleEmbedding = null;
         let contextualCandidates = [];
         if (!hasEmbeddingConfiguration()) {
-            for (const node of nonFavorites)
+            for (const node of candidates)
                 embeddingStatusByNode.set(node.id, "not-configured");
         }
-        if (hasEmbeddingConfiguration() && nonFavorites.length > 0) {
+        if (hasEmbeddingConfiguration() && candidates.length > 0) {
             const requestedQueries = expandedQueries.length > 0
                 ? expandedQueries
                 : [{ text: query, weight: 1, partIndex: 0, partCount: 1 }];
@@ -5180,7 +5128,7 @@ Return JSON only in this exact shape:
                     })),
                     nodes: {},
                 };
-                contextualCandidates = await Promise.all(nonFavorites.map(async (node) => {
+                contextualCandidates = await Promise.all(candidates.map(async (node) => {
                     const narration = buildNodeEmbeddingText(node);
                     const dialogue = buildNodeDialogueEmbeddingBundle(node);
                     return {
@@ -5229,20 +5177,20 @@ Return JSON only in this exact shape:
                 });
             }
             else {
-                for (const node of nonFavorites)
+                for (const node of candidates)
                     embeddingStatusByNode.set(node.id, "query-failed");
             }
-            for (const node of nonFavorites) {
+            for (const node of candidates) {
                 if (!embeddingStatusByNode.has(node.id))
                     embeddingStatusByNode.set(node.id, "node-failed");
             }
         }
         // Semantic dialogue lane: one current dialogue bundle vs one cached dialogue bundle per Memory.
         if (!hasEmbeddingConfiguration()) {
-            for (const node of nonFavorites)
+            for (const node of candidates)
                 dialogueEmbeddingStatusByNode.set(node.id, "not-configured");
         }
-        else if (currentDialogueBundle && nonFavorites.length > 0) {
+        else if (currentDialogueBundle && candidates.length > 0) {
             const dialogueReferenceEmbedding = isFiniteEmbeddingVector(currentDialogueBundleEmbedding)
                 ? currentDialogueBundleEmbedding
                 : null;
@@ -5270,18 +5218,18 @@ Return JSON only in this exact shape:
                 }
             }
             else {
-                for (const node of nonFavorites)
+                for (const node of candidates)
                     dialogueEmbeddingStatusByNode.set(node.id, "query-failed");
             }
         }
             else {
-                for (const node of nonFavorites)
+                for (const node of candidates)
                     dialogueEmbeddingStatusByNode.set(node.id, currentDialogueBundle ? "not-configured" : "empty-node");
             }
-        // Score each non-favorite node. 좋아요 is a separate, wall-clock-decaying preference signal.
+        // Score each Similar candidate.
         const scoreNow = Date.now();
         const scored = [];
-        for (const node of nonFavorites) {
+        for (const node of candidates) {
             const similarityScore = similarityScores.get(node.id) ?? 0;
             const dialogueMatch = getDialogueLocalMatch(node, currentDialogues);
             const dialogueLocal = dialogueMatch?.score ?? 0;
@@ -5290,9 +5238,6 @@ Return JSON only in this exact shape:
             const dialogueEmbeddingContribution = dialogueEmbeddingStatusByNode.get(node.id) === "ok"
                 ? Math.max(0, dialogueEmbedding) * dialogueEmbeddingWeight
                 : 0;
-            const activationMatch = getActivationCueMatch(node, expandedQueries.length > 0 ? expandedQueries.map((item) => item.text) : [query]);
-            const activationCue = activationMatch?.score ?? 0;
-            const activationCueContribution = activationCue * activationCueWeight;
             const likeBonus = getLikeBonus(node, scoreNow);
             scored.push({
                 node,
@@ -5304,12 +5249,9 @@ Return JSON only in this exact shape:
                 dialogueEmbeddingContribution,
                 dialogueEmbeddingStatus: dialogueEmbeddingStatusByNode.get(node.id) ?? (hasEmbeddingConfiguration() ? "empty-node" : "not-configured"),
                 dialogueEmbeddingMatch: dialogueEmbeddingMatches.get(node.id),
-                activationCue,
-                activationCueContribution,
-                activationCueMatch: activationMatch?.provenance,
                 embeddingStatus: embeddingStatusByNode.get(node.id) ?? (hasEmbeddingConfiguration() ? "node-failed" : "not-configured"),
                 likeBonus,
-                combined: similarityScore + dialogueContribution + dialogueEmbeddingContribution + activationCueContribution + likeBonus,
+                combined: similarityScore + dialogueContribution + dialogueEmbeddingContribution + likeBonus,
             });
         }
         // Store scores for display
@@ -5327,9 +5269,6 @@ Return JSON only in this exact shape:
                 dialogueEmbeddingQueryCount,
                 dialogueEmbeddingChildCount: dialogueEmbeddingChildCountByNode.get(s.node.id) ?? 0,
                 dialogueEmbeddingMatch: s.dialogueEmbeddingMatch,
-                activationCue: s.activationCue,
-                activationCueContribution: s.activationCueContribution,
-                activationCueMatch: s.activationCueMatch,
                 embeddingStatus: s.embeddingStatus,
                 embeddingMode: "query-separated",
                 embeddingQueryCount: effectiveEmbeddingQueryCount,
@@ -5337,18 +5276,13 @@ Return JSON only in this exact shape:
                 combined: s.combined,
             });
         }
-        // Favorites get max score for display
-        for (const f of favorites) {
-            nodeScores.set(f.id, { similarity: 1.0, likeBonus: 0, combined: 1.0 });
-        }
-        // Sort non-favorites by score descending
         scored.sort((a, b) => b.combined - a.combined);
-        // Choose nodes within the similarity-memory budget — favorites first.
+        // Choose nodes within the Similar memory budget.
         // Main-model memory budgeting uses o200k_base and includes the configured
         // separator exactly as the final chosen context will render it.
         budgetItems ??= await prepareMemoryBudgetItems(allNodes);
         const budgetById = new Map(budgetItems.map(item => [item.node.id, item]));
-        const rankedCandidates = [...sortNodesByTime(favorites), ...scored.filter(item => item.combined >= 0.05).map(item => item.node)];
+        const rankedCandidates = scored.filter(item => item.combined >= 0.05).map(item => item.node);
         const selection = selectWithinTokenBudget(rankedCandidates.map(node => budgetById.get(node.id)).filter(Boolean),
             tokenBudget, countMemoryTokensSync(resolveInjectionText(memorySeparator)), "skip");
         const chosen = selection.items.map(item => item.node);
@@ -5366,8 +5300,7 @@ Return JSON only in this exact shape:
             scores: {
                 content: item.similarity, dialogueSemantic: item.dialogueEmbedding,
                 dialogueSemanticContribution: item.dialogueEmbeddingContribution, dialogueLexical: item.dialogueLocal,
-                dialogueLexicalContribution: item.dialogueContribution, activation: item.activationCue,
-                activationContribution: item.activationCueContribution, likeBonus: item.likeBonus, total: item.combined,
+                dialogueLexicalContribution: item.dialogueContribution, likeBonus: item.likeBonus, total: item.combined,
             },
         }));
         // Sort chosen memory by time for chronological context.
@@ -6287,7 +6220,7 @@ Return JSON only in this exact shape:
     // Settings edits belong to the current GUI session, not the retrieval runtime.
     // Deliberately no unload/pagehide handler: refresh discards uncommitted edits.
     const PRESET_FIELDS = ["hp-prompt-textarea", "hp-chunk-size", "hp-summary-retain-messages", "hp-include-user", "hp-embedding-context", "hp-max-tokens", "hp-recent-memory-ratio", "hp-memory-separator", "hp-event-format"];
-    const SEARCH_FIELDS = ["hp-query-paragraph-group-size", "hp-dialogue-embedding-weight", "hp-dialogue-local-weight", "hp-activation-cue-weight", "hp-like-bonus-base"];
+    const SEARCH_FIELDS = ["hp-query-paragraph-group-size", "hp-dialogue-embedding-weight", "hp-dialogue-local-weight", "hp-like-bonus-base"];
     const INJECTION_FIELDS = ["hp-memory-injection-namespace", "hp-memory-injection-anchor", "hp-memory-injection-template"];
     const COMMON_FIELDS = ["hp-embedding-url", "hp-embedding-model", "hp-embedding-api-key", "hp-node-translation-url", "hp-node-translation-key", "hp-node-translation-model", "hp-node-translation-language", "hp-node-translation-prompt", "hp-node-translation-max-tokens", "hp-node-translation-temperature", "hp-summarizer-note"];
     const settingsEdits = new Map();
@@ -6341,7 +6274,6 @@ Return JSON only in this exact shape:
             "hp-query-paragraph-group-size": "Query 문단 묶음",
             "hp-dialogue-embedding-weight": "의미 대사",
             "hp-dialogue-local-weight": "어휘 대사",
-            "hp-activation-cue-weight": "활성 키",
             "hp-like-bonus-base": "좋아요 기본 보너스",
         };
         const integers = new Set(["hp-chunk-size", "hp-summary-retain-messages", "hp-embedding-context", "hp-max-tokens", "hp-node-translation-max-tokens", "hp-query-paragraph-group-size"]);
@@ -6645,7 +6577,7 @@ Return JSON only in this exact shape:
         .hp-btn.small { padding:4px 10px; font-size:var(--hp-ui-font-small); }
         .hp-btn.has-icon { display:inline-flex; align-items:center; justify-content:center; gap:6px; }
         .hp-btn.icon-only { padding:4px 7px; }
-        .hp-btn:focus-visible, .hp-fav-node:focus-visible, .hp-like-node:focus-visible, .hp-close-btn:focus-visible:focus-visible { outline:2px solid var(--hp-primary); outline-offset:2px; }
+        .hp-btn:focus-visible, .hp-like-node:focus-visible, .hp-close-btn:focus-visible:focus-visible { outline:2px solid var(--hp-primary); outline-offset:2px; }
         .hp-btn.hp-orphan-disabled:disabled { background:var(--hp-secondary); opacity:.42; cursor:not-allowed; }
         .hp-btn.hp-node-edit-action, .hp-btn.hp-node-delete-action { background:transparent; border-color:transparent; }
         .hp-btn.hp-node-edit-action { color:var(--hp-node-edit-text); }
@@ -6703,14 +6635,6 @@ Return JSON only in this exact shape:
         .hp-memory-status-badge.recent { background:var(--hp-recent-badge-background); color:var(--hp-recent-badge-text); }
         .hp-node-action-row { display:flex; align-items:center; justify-content:flex-start; gap:3px; width:100%; min-width:0; margin-top:3px; }
         .hp-node-action-left { display:inline-flex; align-items:center; gap:3px; flex:0 0 auto; }
-        .hp-node-tag-strip { display:flex; align-items:center; gap:4px; flex:1 1 0; min-width:0; overflow-x:auto; overscroll-behavior-x:contain; max-height:32px; scrollbar-width:thin; }
-        .hp-node-tag-strip .hp-proto-tag { flex:0 0 auto; max-width:140px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-        .hp-node-heading .hp-proto-category { flex:0 1 auto; max-width:28%; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
-        .hp-metadata-button { display:inline-flex; align-items:center; justify-content:center; flex:0 0 32px; width:32px; height:32px; padding:5px; }
-        .hp-metadata-button svg { display:block; width:20px; height:20px; }
-        .hp-metadata-dialog { box-sizing:border-box; width:min(440px,calc(100vw - 24px)); max-height:calc(100dvh - 32px); overflow:auto; }
-        .hp-metadata-dialog label { display:block; margin:12px 0; }
-        .hp-metadata-dialog label span { display:block; margin-bottom:6px; }
         .hp-node-action-meta { display:inline-flex; align-items:center; justify-content:flex-end; gap:4px; flex-wrap:wrap; min-width:0; margin-left:auto; }
         .hp-content { font-family:var(--hp-reading-font); font-size:var(--hp-reading-body); line-height:1.6; margin:6px 0; white-space:pre-wrap; }
         .hp-node-stats { margin-top:6px; min-height:16px; display:flex; align-items:center; gap:6px; font-size:var(--hp-ui-font-meta); }
@@ -6848,9 +6772,6 @@ Return JSON only in this exact shape:
         .hp-proto-id { display:inline-flex; align-items:center; color:var(--hp-text-muted); font-size:var(--hp-ui-font-meta); font-weight:400; line-height:1; }
         .hp-proto-time { display:inline-block; flex:0 1 auto; min-width:0; max-width:100%; overflow:hidden; color:var(--hp-text); text-overflow:clip; white-space:nowrap; }
         .hp-proto-age { color:var(--hp-primary); font-size:11px; font-weight:600; }
-        .hp-proto-chip { display:inline-flex; align-items:center; max-width:180px; padding:2px 7px; border:var(--hp-border-width) solid var(--hp-border); border-radius:var(--hp-radius-pill); font-size:11px; line-height:1.4; color:var(--hp-text); background:var(--hp-inset); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .hp-proto-tag { opacity:.9; }
-        .hp-proto-category { font-weight:bold; }
         .hp-proto-source-row { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-top:9px; padding-top:8px; border-top:var(--hp-border-width) solid var(--hp-border); }
         .hp-node-footer { justify-content:space-between; flex-wrap:nowrap; width:100%; min-width:0; }
         .hp-node-footer-source { display:flex; align-items:center; gap:7px; flex:1 1 auto; min-width:0; flex-wrap:wrap; }
@@ -6901,7 +6822,6 @@ Return JSON only in this exact shape:
         .hp-node-create-number { color:var(--hp-text-muted); font-size:var(--hp-ui-font-small); font-weight:400; }
         .hp-node-create-header .hp-node-editor-time-title { flex:1 1 auto; width:auto; font-size:22px; }
         .hp-node-create-actions { display:flex; align-items:center; gap:3px; width:100%; min-width:0; margin:2px 0 3px; }
-        .hp-node-create-actions .hp-node-tag-strip { min-height:32px; }
         .hp-node-create-links { margin-top:7px; }
         .hp-node-create-links .hp-input { box-sizing:border-box; width:100%; max-width:none; }
         .hp-node-create-description { flex:0 0 auto; margin:0 0 6px; color:var(--hp-text-muted); font-size:var(--hp-ui-font-small); }
@@ -6924,10 +6844,6 @@ Return JSON only in this exact shape:
         .hp-toggle input:checked+.slider { background:var(--hp-primary); }
         .hp-toggle input:checked+.slider:before { transform:translateX(20px); }
         .hp-wrap pre, .hp-wrap code { background-color:var(--hp-inset) !important; }
-        .hp-fav-node { appearance:none; box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; width:26px; height:26px; border:none; background:none; color:var(--hp-text-muted); cursor:pointer; line-height:1; margin:0; padding:3px; }
-        .hp-fav-node .material-symbols-outlined { font-size:20px; font-variation-settings:"FILL" 0,"wght" 400,"GRAD" 0,"opsz" 24; }
-        .hp-fav-node[data-favorite="true"] .material-symbols-outlined { font-variation-settings:"FILL" 1,"wght" 400,"GRAD" 0,"opsz" 24; }
-        .hp-fav-node[data-favorite="true"], .hp-fav-node:hover { color:var(--hp-favorite); }
         .hp-node-menu-wrap { position:relative; display:inline-flex; align-items:center; }
         .hp-node-menu-button { appearance:none; width:26px; height:26px; margin:0; padding:2px; border:none; background:none; color:var(--hp-text-muted); cursor:pointer; }
         .hp-node-menu-button:hover { color:var(--hp-text-strong); }
@@ -6942,12 +6858,6 @@ Return JSON only in this exact shape:
         .hp-card-inline-content:focus { border-color:var(--hp-primary); }
         .hp-card-inline-time { appearance:none; box-sizing:border-box; flex:1 1 auto; min-width:0; max-width:100%; padding:1px 2px; border:0; border-bottom:var(--hp-border-width-subtle) solid transparent; background:transparent; color:var(--hp-text); font:inherit; font-weight:bold; outline:none; }
         .hp-card-inline-time:hover, .hp-card-inline-time:focus { border-bottom-color:var(--hp-border); }
-        .hp-card-inline-meta { display:grid; grid-template-columns:minmax(0,1fr); gap:6px; margin:6px 0 8px; }
-        .hp-card-inline-meta-field { min-width:0; }
-        .hp-card-inline-meta-field .hp-field-label { display:block; margin-bottom:3px; font-size:var(--hp-ui-font-meta); color:var(--hp-text-muted); }
-        .hp-card-inline-meta-input { box-sizing:border-box; width:100%; min-width:0; padding:5px 7px; border:var(--hp-border-width-subtle) solid color-mix(in srgb,var(--hp-border) 70%,transparent); border-radius:var(--hp-radius-xs); background:transparent; color:var(--hp-text); outline:none; }
-        .hp-card-inline-meta-input:focus { border-color:var(--hp-primary); }
-        @media (max-width:640px) { .hp-card-inline-meta { grid-template-columns:1fr; } }
         .hp-card-inline-history { display:inline-flex; align-items:center; gap:4px; margin-right:4px; }
         .hp-history-icon-btn { box-sizing:border-box; display:inline-flex; align-items:center; justify-content:center; inline-size:28px; block-size:28px; padding:5px; }
         .hp-history-icon-btn svg { display:block; inline-size:18px; block-size:18px; flex:0 0 auto; }
@@ -7096,7 +7006,7 @@ Return JSON only in this exact shape:
       <span class="hp-memory-subbar-spacer" aria-hidden="true"></span>
       <button class="hp-search-toggle" id="hp-search-toggle" type="button" title="기억 검색" aria-label="기억 검색" aria-expanded="${nodeSearchOpen}">🔍</button>
       <div class="hp-search-overlay" id="hp-search-overlay" ${nodeSearchOpen ? "" : "hidden"}>
-        <input class="hp-input" type="text" id="hp-node-search" placeholder="기억 검색 (내용, 시간, 카테고리, 태그)..." value="${escapeHtml(nodeSearchDraft)}">
+        <input class="hp-input" type="text" id="hp-node-search" placeholder="기억 검색 (내용, 시간)..." value="${escapeHtml(nodeSearchDraft)}">
         <button class="hp-btn primary small" id="hp-node-search-submit" type="button">검색</button>
         ${nodeSearchQuery ? `<button class="hp-btn secondary small" id="hp-node-search-clear">초기화</button>` : ""}
       </div>
@@ -7118,8 +7028,6 @@ Return JSON only in this exact shape:
                 const q = normalizedNodeQuery;
                 return (n.content.toLowerCase().includes(q) ||
                     n.time.toLowerCase().includes(q) ||
-                    (n.category?.toLowerCase().includes(q) ?? false) ||
-                    (n.tags ?? []).some((tag) => tag.toLowerCase().includes(q)) ||
                     isEditedNodeRevealTarget(n));
             })
             : sortedNodes;
@@ -7292,19 +7200,11 @@ Return JSON only in this exact shape:
         html += `</div>`;
         return html;
     }
-    // Design-refine UI: card state icons -> single Similar/Recent text badge; favorite/like actions moved to the card footer.
     function memoryStateClasses(isChosen, isRecent) {
         return `${isChosen ? " hp-memory-similar" : ""}${isRecent ? " hp-memory-recent" : ""}`;
     }
     function renderNodeStats(node, scores) {
         const tokenEstimate = `<span class="hp-token-estimate" title="${escapeHtml(memoryTokenizerStatusTitle())}">≈ ${estimateNodeTokens(node)}</span>`;
-        if (node.favorite) {
-            return `
-      <div class="hp-node-stats">
-        <span class="hp-node-similarity" title="즐겨찾기는 검색 점수와 무관하게 먼저 주입됩니다.">즐겨찾기 · 항상 주입</span>
-        ${tokenEstimate}
-      </div>`;
-        }
         if (!scores) {
             return `
       <div class="hp-node-stats">
@@ -7332,9 +7232,6 @@ Return JSON only in this exact shape:
         }
         if ((scores.dialogueEmbeddingContribution ?? 0) > 0) {
             scoreParts.push({ kind: "dialogue", text: `대사임베딩 ${(scores.dialogueEmbedding ?? 0).toFixed(2)} (+${(scores.dialogueEmbeddingContribution ?? 0).toFixed(2)})` });
-        }
-        if ((scores.activationCueContribution ?? 0) > 0) {
-            scoreParts.push({ kind: "bonus", text: `활성키 +${(scores.activationCueContribution ?? 0).toFixed(2)}` });
         }
         if ((scores.likeBonus ?? 0) > 0) {
             scoreParts.push({ kind: "bonus", text: `좋아요 +${(scores.likeBonus ?? 0).toFixed(2)}` });
@@ -7413,178 +7310,6 @@ Return JSON only in this exact shape:
       </div>`;
         }
         return `<div class="hp-content">${renderContentRichText(node.content)}</div>`;
-    }
-    function renderMemoryMetadataButton(node) {
-        return `<button class="hp-btn secondary small icon-only hp-metadata-button" type="button" data-node-id="${escapeHtml(node.id)}" title="태그·분류 편집" aria-label="태그·분류 편집" aria-haspopup="dialog">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
-        <path d="M4 6C4 3.79086 5.79086 2 8 2H9C9.55228 2 10 2.44772 10 3C10 3.55228 9.55228 4 9 4H8C6.89543 4 6 4.89543 6 6V20.0568L10.8375 16.6014C11.5329 16.1047 12.4671 16.1047 13.1625 16.6014L18 20.0568V13C18 12.4477 18.4477 12 19 12C19.5523 12 20 12.4477 20 13V20.0568C20 21.6836 18.1613 22.6298 16.8375 21.6843L12 18.2289L7.16248 21.6843C5.83874 22.6298 4 21.6836 4 20.0568V6Z" fill="currentColor"/>
-        <path d="M17 3C17 2.44772 16.5523 2 16 2C15.4477 2 15 2.44772 15 3V5H13C12.4477 5 12 5.44772 12 6C12 6.55228 12.4477 7 13 7H15V9C15 9.55228 15.4477 10 16 10C16.5523 10 17 9.55228 17 9V7H19C19.5523 7 20 6.55228 20 6C20 5.44772 19.5523 5 19 5H17V3Z" fill="currentColor"/>
-      </svg></button>`;
-    }
-    async function showMemoryMetadataDialog(node) {
-        if (document.querySelector(".hp-metadata-dialog"))
-            return;
-        await flushInlineCardChanges();
-        if (!getMemoryEntry(node))
-            return;
-        const overlay = document.createElement("div");
-        overlay.className = "hp-edit-overlay";
-        overlay.innerHTML = `<form class="hp-edit-box hp-metadata-dialog" role="dialog" aria-modal="true" aria-labelledby="hp-metadata-title">
-      <h3 id="hp-metadata-title">태그·분류</h3>
-      <label><span>분류</span><input class="hp-input" name="category" value="${escapeHtml(node.category ?? "")}" autocomplete="off"></label>
-      <label><span>태그 (쉼표로 구분)</span><textarea class="hp-textarea" name="tags" rows="3">${escapeHtml((node.tags ?? []).join(", "))}</textarea></label>
-      <p data-error role="status"></p>
-      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="hp-btn secondary" type="button" data-cancel>취소</button><button class="hp-btn hp-popup-save-action" type="button" data-save>저장</button></div>
-    </form>`;
-        document.body.appendChild(overlay);
-        const form = overlay.querySelector("form");
-        const category = form.elements.namedItem("category");
-        const tags = form.elements.namedItem("tags");
-        let saving = false;
-        const close = () => {
-            overlay.remove();
-            document.querySelector(`.hp-metadata-button[data-node-id="${CSS.escape(node.id)}"]`)?.focus();
-        };
-        form.querySelector("[data-cancel]").addEventListener("click", () => { if (!saving)
-            close(); });
-        form.addEventListener("keydown", event => {
-            if (event.key === "Escape") {
-                event.preventDefault();
-                if (!saving)
-                    close();
-            }
-            if (event.key === "Tab") {
-                const inputs = Array.from(form.querySelectorAll("input,textarea,button:not(:disabled)"));
-                const first = inputs[0], last = inputs[inputs.length - 1];
-                if (event.shiftKey && document.activeElement === first) {
-                    event.preventDefault();
-                    last.focus();
-                }
-                else if (!event.shiftKey && document.activeElement === last) {
-                    event.preventDefault();
-                    first.focus();
-                }
-            }
-        });
-        const saveButton = form.querySelector("[data-save]");
-        const saveMetadata = async () => {
-            if (saving)
-                return;
-            saving = true;
-            saveButton.disabled = true;
-            const previous = { category: node.category, tags: node.tags };
-            let committed = false;
-            try {
-                if (!getMemoryEntry(node))
-                    throw new Error("기억을 찾을 수 없습니다.");
-                await commitMemoryEdit(node, {
-                    category: category.value.trim() || undefined,
-                    tags: [...new Set(tags.value.split(",").map(tag => tag.trim()).filter(Boolean))],
-                });
-                committed = true;
-                invalidateUiSessionRenderData();
-                overlay.remove();
-                await renderUI(true);
-            }
-            catch (error) {
-                if (!committed) {
-                    node.category = previous.category;
-                    node.tags = previous.tags;
-                }
-                form.querySelector("[data-error]").textContent = `저장하지 못했습니다. ${String(error)}`;
-            }
-            finally {
-                saving = false;
-                if (saveButton.isConnected)
-                    saveButton.disabled = false;
-            }
-        };
-        saveButton.addEventListener("click", () => { void saveMetadata(); });
-        form.addEventListener("submit", event => {
-            event.preventDefault();
-            void saveMetadata();
-        });
-        category.focus();
-    }
-    async function showActivationCuesDialog(node) {
-        if (document.querySelector(".hp-activation-dialog"))
-            return;
-        await flushInlineCardChanges();
-        if (!getMemoryEntry(node))
-            return;
-        const overlay = document.createElement("div");
-        overlay.className = "hp-edit-overlay";
-        overlay.innerHTML = `<form class="hp-edit-box hp-activation-dialog" role="dialog" aria-modal="true" aria-labelledby="hp-activation-title">
-      <h3 id="hp-activation-title">활성키</h3>
-      <label><span>활성키</span><textarea class="hp-textarea" name="cues" rows="3">${escapeHtml((node.activationCues ?? []).join(", "))}</textarea></label>
-      <p data-error role="status"></p>
-      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="hp-btn secondary" type="button" data-cancel>취소</button><button class="hp-btn hp-popup-save-action" type="button" data-save>저장</button></div>
-    </form>`;
-        document.body.appendChild(overlay);
-        const form = overlay.querySelector("form");
-        const cues = form.elements.namedItem("cues");
-        let saving = false;
-        const close = () => {
-            overlay.remove();
-            document.querySelector(`.hp-activation-button[data-node-id="${CSS.escape(node.id)}"]`)?.focus({ preventScroll: true });
-        };
-        form.querySelector("[data-cancel]").addEventListener("click", () => { if (!saving)
-            close(); });
-        form.addEventListener("keydown", event => {
-            if (event.key === "Escape") {
-                event.preventDefault();
-                if (!saving)
-                    close();
-            }
-            if (event.key === "Tab") {
-                const inputs = Array.from(form.querySelectorAll("input,textarea,button:not(:disabled)"));
-                const first = inputs[0], last = inputs[inputs.length - 1];
-                if (event.shiftKey && document.activeElement === first) {
-                    event.preventDefault();
-                    last.focus();
-                }
-                else if (!event.shiftKey && document.activeElement === last) {
-                    event.preventDefault();
-                    first.focus();
-                }
-            }
-        });
-        const saveButton = form.querySelector("[data-save]");
-        const saveMetadata = async () => {
-            if (saving)
-                return;
-            saving = true;
-            saveButton.disabled = true;
-            const previous = [...(node.activationCues ?? [])];
-            let committed = false;
-            try {
-                if (!getMemoryEntry(node))
-                    throw new Error("기억을 찾을 수 없습니다.");
-                await commitMemoryEdit(node, { activationCues: [...new Set(cues.value.split(",").map(cue => cue.trim()).filter(Boolean))] });
-                committed = true;
-                recordMemoryEdit(node, "activationCues", previous, [...(node.activationCues ?? [])]);
-                invalidateUiSessionRenderData();
-                overlay.remove();
-                await renderUI(true);
-            }
-            catch (error) {
-                if (!committed) {
-                    node.activationCues = previous;
-                }
-                form.querySelector("[data-error]").textContent = `저장하지 못했습니다. ${String(error)}`;
-            }
-            finally {
-                saving = false;
-                if (saveButton.isConnected)
-                    saveButton.disabled = false;
-            }
-        };
-        saveButton.addEventListener("click", () => { void saveMetadata(); });
-        form.addEventListener("submit", event => {
-            event.preventDefault();
-            void saveMetadata();
-        });
-        cues.focus();
     }
     function renderNodeTranslationAction(node) {
         const busy = translatingNodeIds.has(node.id);
@@ -7717,11 +7442,11 @@ Return JSON only in this exact shape:
             ageDays == null ? "-" : String(ageDays), compactLedgerNumber(score.content),
             compactLedgerNumber(score.dialogueSemantic), compactLedgerNumber(score.dialogueSemanticContribution),
             compactLedgerNumber(score.dialogueLexical), compactLedgerNumber(score.dialogueLexicalContribution),
-            compactLedgerNumber(score.activation), compactLedgerNumber(score.activationContribution),
+            "-", "-", // Legacy activation score and contribution slots.
             compactLedgerNumber(score.likeBonus), compactLedgerNumber(score.total),
             input.source === "S" ? compactLedgerNumber(dialogueEmbeddingWeight) : "-",
             input.source === "S" ? compactLedgerNumber(dialogueLocalWeight) : "-",
-            input.source === "S" ? compactLedgerNumber(activationCueWeight) : "-",
+            "-", // Legacy activation weight slot.
             input.source === "S" ? compactLedgerNumber(likeBonusBase) : "-",
         ].join("|");
     }
@@ -7829,11 +7554,6 @@ Return JSON only in this exact shape:
         const isChosen = state.lastChosenNodeIds?.includes(node.id) ?? false;
         const memoryStatusBadge = `${isChosen ? `<span class="hp-memory-status-badge similar" title="현재 컨텍스트와 유사한 기억">Similar</span>` : ""}${isRecent ? `<span class="hp-memory-status-badge recent" title="최근 메모리">Recent</span>` : ""}`;
         const memoryClasses = memoryStateClasses(isChosen, isRecent);
-        const tagChips = (node.tags ?? []).filter(Boolean)
-            .map((tag) => `<span class="hp-proto-chip hp-proto-tag" title="${escapeHtml(tag)}">${escapeHtml(tag)}</span>`).join("");
-        const categoryChip = node.category?.trim()
-            ? `<span class="hp-proto-chip hp-proto-category" title="${escapeHtml(node.category.trim())}">${escapeHtml(node.category.trim())}</span>`
-            : "";
         const relativeAge = formatProtoRelativeAge(node.time);
         const entryLinkClass = linkPosition === "single" ? "" : ` hp-sourcegroup-link-${linkPosition}`;
         return `
@@ -7844,16 +7564,16 @@ Return JSON only in this exact shape:
             ${parentChunk ? renderEntrySelection(parentChunk) : ""}
             <span class="hp-proto-id">#${memoryDisplayNumber(node)}</span>
           </span>
-          ${categoryChip}
           ${cardInlineEditMode ? `<input class="hp-card-inline-time" data-node-id="${node.id}" value="${escapeHtml(node.time)}" aria-label="기억 제목">` : `<strong class="hp-proto-time">${escapeHtml(node.time)}</strong>`}
           ${relativeAge ? `<span class="hp-proto-age">${escapeHtml(relativeAge)}</span>` : ""}
         </span>
         <span class="hp-node-status-slot">${memoryStatusBadge}</span>
       </div>
       <div class="hp-node-action-row">
-        <span class="hp-node-action-left">          <button class="hp-btn small hp-delete-node hp-node-delete-action has-icon icon-only" type="button" data-node-id="${node.id}" aria-label="삭제" title="삭제"><span class="material-symbols-outlined hp-icon-delete-filled" aria-hidden="true">delete</span></button>
-          ${renderNodeTranslationAction(node)}${renderMemoryMetadataButton(node)}<button class="hp-btn secondary small hp-activation-button" type="button" data-node-id="${escapeHtml(node.id)}" aria-haspopup="dialog">활성키</button></span>
-        <span class="hp-node-tag-strip">${tagChips}</span>
+        <span class="hp-node-action-left">
+          <button class="hp-btn small hp-delete-node hp-node-delete-action has-icon icon-only" type="button" data-node-id="${node.id}" aria-label="삭제" title="삭제"><span class="material-symbols-outlined hp-icon-delete-filled" aria-hidden="true">delete</span></button>
+          ${renderNodeTranslationAction(node)}
+        </span>
       </div>
       ${renderNodeDisplayedContent(node)}
       ${renderNodeStats(node, scores)}
@@ -7867,7 +7587,6 @@ Return JSON only in this exact shape:
               <button class="hp-node-menu-item hp-node-lorebook-placeholder" type="button" data-node-id="${node.id}" aria-label="로어북 내보내기" title="로어북 내보내기"><span class="material-symbols-outlined" aria-hidden="true">book_5</span></button>
             </span>
           </span>
-          <button class="hp-fav-node" type="button" data-node-id="${node.id}" data-favorite="${node.favorite === true}" title="${node.favorite ? "즐겨찾기 해제" : "즐겨찾기"}" aria-label="${node.favorite ? "즐겨찾기 해제" : "즐겨찾기"}"><span class="material-symbols-outlined" aria-hidden="true">star</span></button>
           ${renderNodeLikeAction(node)}
         </span>
       </div>
@@ -8054,10 +7773,6 @@ ${renderRegexPanel()}
         <div class="hp-row hp-settings-form-row hp-settings-form-row-mobile-stack hp-settings-form-row-compact">
           <span class="hp-label hp-label-with-help">어휘 대사${renderSettingsHelp(`현재 대사와 기억 속 대사의 어휘 일치 점수에 곱합니다. 기본값 <code>${DEFAULT_DIALOGUE_LOCAL_WEIGHT}</code>`)}</span>
           <input class="hp-input" type="number" id="hp-dialogue-local-weight" value="${dialogueLocalWeight}" min="0" step="0.01" inputmode="decimal" style="width:110px;">
-        </div>
-        <div class="hp-row hp-settings-form-row hp-settings-form-row-mobile-stack hp-settings-form-row-compact">
-          <span class="hp-label hp-label-with-help">활성 키${renderSettingsHelp(`활성 키 매칭 점수에 곱합니다. 기본값 <code>${DEFAULT_ACTIVATION_CUE_WEIGHT}</code>`)}</span>
-          <input class="hp-input" type="number" id="hp-activation-cue-weight" value="${activationCueWeight}" min="0" step="0.01" inputmode="decimal" style="width:110px;">
         </div>
         <div class="hp-row hp-settings-form-row hp-settings-form-row-mobile-stack hp-settings-form-row-compact">
           <span class="hp-label hp-label-with-help">좋아요 기본 보너스${renderSettingsHelp(`좋아요 직후 더할 최대값입니다. 4일 동안 선형으로 감소합니다. 기본값 <code>${DEFAULT_LIKE_BONUS_BASE}</code>`)}</span>
@@ -8288,54 +8003,6 @@ ${renderRegexPanel()}
         }
         return [...result].sort((a, b) => a - b);
     }
-    function updateCreateMetadataSummary() {
-        const category = document.getElementById("hp-create-category")?.value.trim() ?? "";
-        const tags = document.getElementById("hp-create-tags")?.value
-            .split(",").map(tag => tag.trim()).filter(Boolean) ?? [];
-        const strip = document.getElementById("hp-create-tag-strip");
-        if (!strip)
-            return;
-        strip.innerHTML = `${category ? `<span class="hp-proto-chip hp-proto-category" title="${escapeHtml(category)}">${escapeHtml(category)}</span>` : ""}${tags.map(tag => `<span class="hp-proto-chip hp-proto-tag" title="${escapeHtml(tag)}">${escapeHtml(tag)}</span>`).join("")}`;
-    }
-    function showCreateMemoryMetadataDialog() {
-        if (document.querySelector(".hp-create-metadata-dialog"))
-            return;
-        const categoryStore = document.getElementById("hp-create-category");
-        const tagsStore = document.getElementById("hp-create-tags");
-        if (!categoryStore || !tagsStore)
-            return;
-        const overlay = document.createElement("div");
-        overlay.className = "hp-edit-overlay";
-        overlay.innerHTML = `<form class="hp-edit-box hp-metadata-dialog hp-create-metadata-dialog" role="dialog" aria-modal="true" aria-labelledby="hp-create-metadata-title">
-      <h3 id="hp-create-metadata-title">태그·분류</h3>
-      <label><span>분류</span><input class="hp-input" name="category" value="${escapeHtml(categoryStore.value)}" autocomplete="off"></label>
-      <label><span>태그 (쉼표로 구분)</span><textarea class="hp-textarea" name="tags" rows="3">${escapeHtml(tagsStore.value)}</textarea></label>
-      <div style="display:flex;justify-content:flex-end;gap:8px"><button class="hp-btn secondary" type="button" data-cancel>취소</button><button class="hp-btn hp-popup-save-action" type="submit">등록</button></div>
-    </form>`;
-        document.body.appendChild(overlay);
-        const form = overlay.querySelector("form");
-        const category = form.elements.namedItem("category");
-        const tags = form.elements.namedItem("tags");
-        const close = () => {
-            overlay.remove();
-            document.getElementById("hp-create-metadata")?.focus();
-        };
-        form.querySelector("[data-cancel]").addEventListener("click", close);
-        form.addEventListener("submit", event => {
-            event.preventDefault();
-            categoryStore.value = category.value.trim();
-            tagsStore.value = [...new Set(tags.value.split(",").map(tag => tag.trim()).filter(Boolean))].join(", ");
-            updateCreateMetadataSummary();
-            close();
-        });
-        form.addEventListener("keydown", event => {
-            if (event.key === "Escape") {
-                event.preventDefault();
-                close();
-            }
-        });
-        category.focus();
-    }
     // ── Create Node Overlay ──────────────────────────────────────────────────
     function renderCreateNodeOverlay() {
         const now = nowTimeString();
@@ -8348,18 +8015,8 @@ ${renderRegexPanel()}
           <input class="hp-node-editor-time-title" id="hp-create-time" value="${escapeHtml(now)}" aria-label="시간" title="터치하여 시간 수정">
         </div>
         <div class="hp-node-edit-form">
-          <input type="hidden" id="hp-create-tags" value="">
-          <input type="hidden" id="hp-create-category" value="">
           <div class="hp-node-create-actions">
             <span class="hp-card-inline-history"><button class="hp-btn secondary small icon-only hp-history-icon-btn" type="button" id="hp-create-undo" aria-label="실행 취소" title="실행 취소"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M18 13C17.4904 11.9961 16.6247 11.1655 15.5334 10.6333C14.442 10.1011 13.1842 9.89624 11.9494 10.0495C9.93127 10.3 8.52468 11.6116 7 12.8186M7 10V13H10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="hp-btn secondary small icon-only hp-history-icon-btn" type="button" id="hp-create-redo" aria-label="재실행" title="재실행"><svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M6 13C6.50963 11.9961 7.37532 11.1655 8.46665 10.6333C9.55797 10.1011 10.8158 9.89624 12.0506 10.0495C14.0687 10.3 15.4753 11.6116 17 12.8186M17 10V13H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button></span>
-            ${renderMemoryMetadataButton({ id: "create", time: now, content: "", createdAt: 0 }).replace(/data-node-id="create"/g, `id="hp-create-metadata" data-node-id="create"`)}
-            <span class="hp-node-tag-strip" id="hp-create-tag-strip"></span>
-          </div>
-          <div class="hp-card-inline-meta">
-            <label class="hp-card-inline-meta-field">
-              <span class="hp-field-label">활성 키</span>
-              <input class="hp-card-inline-meta-input" id="hp-create-activation-cues" placeholder="쉼표로 구분">
-            </label>
           </div>
           ${renderNodeContentEditor("create", "")}
           <label class="hp-field hp-node-create-links">
@@ -8873,14 +8530,6 @@ ${renderRegexPanel()}
           ${scores.dialogueEmbeddingMatch ? `<div>현재 대화 묶음:</div><pre class="hp-trace-text">${escapeHtml(scores.dialogueEmbeddingMatch.currentDialogue)}</pre><div>기억 대화 묶음:</div><pre class="hp-trace-text">${escapeHtml(scores.dialogueEmbeddingMatch.storedDialogue)}</pre>` : ""}
         </div>`
             : `<div class="hp-trace-signal-detail">상태: ${escapeHtml(scores?.dialogueEmbeddingStatus ?? "기록 없음")} · 기여 +${(scores?.dialogueEmbeddingContribution ?? 0).toFixed(4)}</div>`;
-        const activationHtml = scores?.activationCueMatch
-            ? `<div class="hp-trace-signal-detail">
-          <div>점수 ${(scores.activationCue ?? 0).toFixed(4)} × 가중치 ${activationCueWeight.toFixed(2)} = <strong>+${(scores.activationCueContribution ?? 0).toFixed(4)}</strong></div>
-          <div>활성 키: ${escapeHtml(scores.activationCueMatch.cue)}</div>
-          <div>매칭 방식: ${escapeHtml(scores.activationCueMatch.method)} · 원점수 ${(scores.activationCueMatch.score ?? 0).toFixed(4)}</div>
-          <div>매칭 대상: ${escapeHtml(scores.activationCueMatch.queryText)}</div>
-        </div>`
-            : `<div class="hp-trace-signal-detail">일치 없음 · 기여 +0.0000</div>`;
         const likeRemaining = node ? getLikeRemaining(node, trace.createdAt) : 0;
         const likeHtml = node?.likedAt
             ? `<div class="hp-trace-signal-detail">
@@ -8889,9 +8538,14 @@ ${renderRegexPanel()}
           <div>감쇠: 4일 선형 · 현재 ${(likeRemaining * 100).toFixed(1)}% 남음</div>
         </div>`
             : `<div class="hp-trace-signal-detail">좋아요 없음 · 기여 +${(scores?.likeBonus ?? 0).toFixed(4)}</div>`;
-        const combinedFormula = scores
-            ? `최종 합산 = 내용 ${scores.similarity.toFixed(4)} + 어휘 대사 ${(scores.dialogueContribution ?? 0).toFixed(4)} + 의미 대사 ${(scores.dialogueEmbeddingContribution ?? 0).toFixed(4)} + 활성 키 ${(scores.activationCueContribution ?? 0).toFixed(4)} + 좋아요 ${(scores.likeBonus ?? 0).toFixed(4)} = ${scores.combined.toFixed(4)}`
-            : "";
+        const activeScore = scores
+            ? scores.similarity + (scores.dialogueContribution ?? 0) + (scores.dialogueEmbeddingContribution ?? 0) + (scores.likeBonus ?? 0)
+            : null;
+        const combinedFormula = !scores
+            ? ""
+            : activeScore === scores.combined
+            ? `최종 합산 = 내용 ${scores.similarity.toFixed(4)} + 어휘 대사 ${(scores.dialogueContribution ?? 0).toFixed(4)} + 의미 대사 ${(scores.dialogueEmbeddingContribution ?? 0).toFixed(4)} + 좋아요 ${(scores.likeBonus ?? 0).toFixed(4)} = ${scores.combined.toFixed(4)}`
+            : `마지막 검색 합계 ${scores.combined.toFixed(4)}`;
         const history = compactRetrievalHistoryForNode(nodeId);
         const historyHtml = history.map((entry) => {
             const sourceLabel = entry.source === "R" ? "Recent" : "Similar";
@@ -8901,8 +8555,8 @@ ${renderRegexPanel()}
                 : ` · Calendar ${entry.calendarAgeDays === 0 ? "오늘" : entry.calendarAgeDays > 0 ? `${entry.calendarAgeDays}일 전` : `${Math.abs(entry.calendarAgeDays)}일 후`}`;
             const scoreText = entry.source === "R"
                 ? `Query ${entry.queryCount}개 · 검색 점수 없음 (Recent 선발)`
-                : `Q ${entry.queryCount} · 내용(C) ${(entry.content ?? 0).toFixed(3)} · 의미 대사(D) ${(entry.dialogueSemantic ?? 0).toFixed(3)} (+${(entry.dialogueSemanticContribution ?? 0).toFixed(3)}) · 어휘 대사(L) ${(entry.dialogueLexical ?? 0).toFixed(3)} (+${(entry.dialogueLexicalContribution ?? 0).toFixed(3)}) · 활성 키(A) ${(entry.activation ?? 0).toFixed(3)} (+${(entry.activationContribution ?? 0).toFixed(3)}) · 좋아요 +${(entry.likeBonus ?? 0).toFixed(3)}`;
-            const totalText = entry.total == null ? "" : `= ${entry.total.toFixed(4)}`;
+                : `Q ${entry.queryCount} · 내용(C) ${(entry.content ?? 0).toFixed(3)} · 의미 대사(D) ${(entry.dialogueSemantic ?? 0).toFixed(3)} (+${(entry.dialogueSemanticContribution ?? 0).toFixed(3)}) · 어휘 대사(L) ${(entry.dialogueLexical ?? 0).toFixed(3)} (+${(entry.dialogueLexicalContribution ?? 0).toFixed(3)}) · 좋아요 +${(entry.likeBonus ?? 0).toFixed(3)}`;
+            const totalText = entry.total == null ? "" : `기록 합계 ${entry.total.toFixed(4)}`;
             return `<div class="hp-trace-score-row">
         <span>${escapeHtml(new Date(entry.at).toLocaleString())} · ${sourceLabel}${rankLabel}${selectedLabel}${calendarLabel}</span>
         <span class="hp-trace-score-text">${escapeHtml(scoreText)}</span>
@@ -8931,8 +8585,6 @@ ${renderRegexPanel()}
       <h4 class="hp-trace-section-title">의미 대사 (Semantic Dialogue)</h4>
       <div class="hp-trace-card">${semanticDialogueHtml}</div>
 
-      <h4 class="hp-trace-section-title">활성 키</h4>
-      <div class="hp-trace-card">${activationHtml}</div>
 
       <h4 class="hp-trace-section-title">좋아요</h4>
       <div class="hp-trace-card">${likeHtml}</div>
@@ -9035,7 +8687,6 @@ ${renderRegexPanel()}
         let totalMatchedMessages = 0;
         let totalUnresolvedMemos = 0;
         let totalNullMemos = 0;
-        let importantCount = 0;
         for (const rawSummary of summariesRaw) {
             if (!rawSummary || typeof rawSummary !== "object" || typeof rawSummary.text !== "string") {
                 invalidCount += 1;
@@ -9076,16 +8727,12 @@ ${renderRegexPanel()}
                 seenChatIds.add(message.chatId);
                 matchedMessages.push(message);
             }
-            const favorite = rawSummary.isImportant === true;
-            if (favorite)
-                importantCount += 1;
             totalMatchedMessages += matchedMessages.length;
             totalUnresolvedMemos += unresolvedMemoCount;
             totalNullMemos += nullMemoCount;
             prepared.push({
                 text,
                 time: extractHypaV3SummaryTime(text),
-                favorite,
                 matchedMessages,
                 unresolvedMemoCount,
                 nullMemoCount,
@@ -9098,7 +8745,6 @@ ${renderRegexPanel()}
             totalMatchedMessages,
             totalUnresolvedMemos,
             totalNullMemos,
-            importantCount,
         };
     }
     async function importCurrentChatHypaV3Data() {
@@ -9127,8 +8773,7 @@ ${renderRegexPanel()}
             `• 이미 존재해 건너뜀: ${prepared.duplicateCount}개\n` +
             `• 연결 확인된 원문 UUID: ${prepared.totalMatchedMessages}개\n` +
             `• 현재 채팅에서 못 찾은 UUID: ${prepared.totalUnresolvedMemos}개\n` +
-            `• null chatMemo: ${prepared.totalNullMemos}개\n` +
-            `• Important → 즐겨찾기: ${prepared.importantCount}개\n\n` +
+            `• null chatMemo: ${prepared.totalNullMemos}개\n\n` +
             `기존 Hypirk 기억은 지우지 않고 뒤에 추가합니다. HypaV3 metrics(마지막 Recent/Similar/Random 기록)는 가져오지 않습니다.`);
         if (!ok)
             return;
@@ -9145,8 +8790,6 @@ ${renderRegexPanel()}
                 content: item.text,
                 createdAt: importedAt + imported,
             };
-            if (item.favorite)
-                memory.favorite = true;
             appendMemoryEntry(memory, linkedMessages);
             imported += 1;
         }
@@ -10124,20 +9767,6 @@ ${renderRegexPanel()}
                 await renderUI();
             }, "clear-memory"));
         });
-        document.querySelectorAll(".hp-metadata-button:not(#hp-create-metadata)").forEach(button => {
-            button.addEventListener("click", safeAsync(async () => {
-                const node = findNodeById(button.dataset.nodeId ?? "");
-                if (node)
-                    await showMemoryMetadataDialog(node);
-            }, "memory-metadata"));
-        });
-        document.querySelectorAll(".hp-activation-button").forEach(button => {
-            button.addEventListener("click", safeAsync(async () => {
-                const node = findNodeById(button.dataset.nodeId ?? "");
-                if (node)
-                    await showActivationCuesDialog(node);
-            }, "memory-activation-cues"));
-        });
         // Memory-card hamburger menu.
         document.querySelectorAll(".hp-node-menu-button").forEach((button) => {
             button.addEventListener("click", (event) => {
@@ -10173,18 +9802,6 @@ ${renderRegexPanel()}
                 // Reserved for future node-level lorebook export.
             });
         });
-        // Favorite node toggle
-        document.querySelectorAll(".hp-fav-node").forEach((btn) => {
-            btn.addEventListener("click", safeAsync(async () => {
-                const nodeId = btn.dataset.nodeId;
-                const node = findNodeById(nodeId);
-                if (!node)
-                    return;
-                await commitMemoryEdit(node, { favorite: !node.favorite });
-                renderUI();
-            }, "fav-node"));
-        });
-        // 좋아요 is independent from favorites: it adds a decaying retrieval bonus for four days.
         document.querySelectorAll(".hp-like-node").forEach((btn) => {
             btn.addEventListener("click", safeAsync(async () => {
                 const nodeId = btn.dataset.nodeId;
@@ -10461,10 +10078,6 @@ ${renderRegexPanel()}
         const createContentInput = document.getElementById("hp-create-content");
         if (createContentInput)
             attachNodeContentEditorTools("create", createContentInput);
-        document.getElementById("hp-create-metadata")?.addEventListener("click", (event) => {
-            event.preventDefault();
-            showCreateMemoryMetadataDialog();
-        });
         // Create node overlay: cancel
         const createCancelBtn = document.getElementById("hp-create-cancel");
         if (createCancelBtn) {
@@ -10489,18 +10102,10 @@ ${renderRegexPanel()}
                     alert("연결 메시지 인덱스를 확인해주세요. 예: 5, 8-11, #14");
                     return;
                 }
-                const tags = document.getElementById("hp-create-tags").value
-                    .split(",").map((tag) => tag.trim()).filter(Boolean);
-                const category = document.getElementById("hp-create-category").value.trim() || undefined;
-                const activationCues = document.getElementById("hp-create-activation-cues").value
-                    .split(",").map((cue) => cue.trim()).filter(Boolean);
                 const node = {
                     id: nextNodeId(),
                     time,
-                    category,
-                    tags,
                     content,
-                    activationCues: activationCues.length > 0 ? activationCues : undefined,
                     createdAt: Date.now(),
                 };
                 appendMemoryEntry(node, linkedMessages);
@@ -10778,9 +10383,9 @@ ${renderRegexPanel()}
                 return;
             const number = (id) => Number(document.getElementById(id).value);
             const next = SEARCH_FIELDS.map(number);
-            const previous = [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, activationCueWeight, likeBonusBase];
+            const previous = [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, likeBonusBase];
             const changed = next.some((value, index) => value !== previous[index]);
-            [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, activationCueWeight, likeBonusBase] = next;
+            [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, likeBonusBase] = next;
             try {
                 await saveSettings();
                 if (changed) {
@@ -10793,7 +10398,7 @@ ${renderRegexPanel()}
                 }
             }
             catch (error) {
-                [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, activationCueWeight, likeBonusBase] = previous;
+                [queryParagraphGroupSize, dialogueEmbeddingWeight, dialogueLocalWeight, likeBonusBase] = previous;
                 throw error;
             }
             clearSettingsEdits(SEARCH_FIELDS);
